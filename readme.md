@@ -105,6 +105,7 @@ setup, no native compilation. Just Kotlin, Compose, and Skia.
 ./gradlew run
 ```
 
+
 The application window opens with a default shader already loaded.
 Press **Update preview from editor** to re-render after editing.
 
