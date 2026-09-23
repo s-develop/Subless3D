@@ -1,5 +1,6 @@
-```markdown
 ![Subless3D main window](docs/screenshot.png)
+```markdown
+
 # Subless3D — Shader Baker
 
 A desktop application for previewing, debugging, and baking fragment shaders into
