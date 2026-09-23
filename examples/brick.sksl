@@ -1,0 +1,313 @@
+/*
+
+================================================================================
+  Brick Wall — tileable procedural texture
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+                 See LICENSE in the project root for the full text.
+
+  This is an original work written from scratch. It does not share code
+  with any third-party shader. The visual subject — a brick wall — is a
+  common motif and not attributable to any single author.
+
+  Features:
+      * Fully tileable in both axes
+      * Per-brick hue, brightness and surface variation
+      * Beveled edges with analytic AO
+      * Tangent-space normal derived from the height field
+      * Mortar grooves with recessed shading
+      * Two directional lights + ambient
+
+  How tiling is achieved:
+      * Brick grid is aligned so a whole number of bricks fits into
+        UV [0, 1] in both axes. Column count = 6, row count = 12.
+      * Per-brick randomness is keyed by wrapped cell id, so the last
+        column/row of one tile matches the first column/row of the next.
+      * A shared wdiff() helper computes shortest distance on a circle
+        of period 1, so all cross-axis offsets wrap.
+
+================================================================================
+*/
+
+uniform float2 resolution;
+uniform float time;
+
+const float TAU = 6.28318530718;
+
+// ============================================================
+//  Hashes
+// ============================================================
+
+float hash11(float x) {
+    return fract(sin(x * 78.233) * 43758.5453);
+}
+
+float hash21(float2 p) {
+    return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
+}
+
+float2 hash22(float2 p) {
+    float3 p3 = fract(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+// ============================================================
+//  Tileable helpers
+// ============================================================
+
+float wdiff(float a, float b) {
+    float d = a - b;
+    return d - floor(d + 0.5);
+}
+
+float wabs(float a, float b) {
+    return abs(wdiff(a, b));
+}
+
+// ============================================================
+//  Value noise (tileable via wrapped integer lattice)
+// ============================================================
+
+float noiseT(float2 p, float period) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float2 i00 = mod(i + float2(0.0, 0.0), float2(period));
+    float2 i10 = mod(i + float2(1.0, 0.0), float2(period));
+    float2 i01 = mod(i + float2(0.0, 1.0), float2(period));
+    float2 i11 = mod(i + float2(1.0, 1.0), float2(period));
+
+    float a = hash21(i00);
+    float b = hash21(i10);
+    float c = hash21(i01);
+    float d = hash21(i11);
+
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// ============================================================
+//  Brick grid
+//
+//  6 columns × 12 rows per tile. Even rows are shifted by half a
+//  brick. All randomness is keyed by the wrapped cell id, so the
+//  pattern repeats exactly at UV = 1.
+//
+//  Returns:
+//      edge    — signed distance to nearest brick border (0 = edge)
+//      cellId  — unique float id of the brick
+//      local   — UV inside the brick, both components in [0, 1]
+//      height  — per-brick height variation (for normal + AO)
+// ============================================================
+
+struct Brick {
+    float edge;
+    float cellId;
+    float2 local;
+    float height;
+};
+
+Brick getBrick(float2 uv) {
+    const float COLS = 6.0;
+    const float ROWS = 12.0;
+
+    // Row and column coordinates with row offsetting
+    float y = uv.y * ROWS;
+    float rowF = floor(y);
+    float rowHalf = rowF - floor(rowF * 0.5) * 2.0;   // 0.0 or 1.0
+    float x = uv.x * COLS + rowHalf * 0.5;
+    float colF = floor(x);
+
+    float localY = fract(y);
+    float localX = fract(x);
+
+    // Cell id: wrap both coordinates to the period
+    float cellY = mod(rowF, ROWS);
+    float cellX = mod(colF, COLS);
+    float cellId = cellY * COLS + cellX;
+
+    // Distance to brick border, in local brick units
+    float dx = min(localX, 1.0 - localX);
+    float dy = min(localY, 1.0 - localY);
+    float edge = min(dx, dy);
+
+    // Per-brick height offset
+    float h = hash11(cellId * 1.13) - 0.5;
+
+    Brick b;
+    b.edge = edge;
+    b.cellId = cellId;
+    b.local = float2(localX, localY);
+    b.height = h;
+    return b;
+}
+
+// ============================================================
+//  Surface colour
+// ============================================================
+
+float3 brickColor(float id, float2 local, float2 uv) {
+    float r0 = hash21(float2(id, 3.7));
+    float r1 = hash21(float2(id, 11.3));
+    float r2 = hash21(float2(id, 27.9));
+
+    // Palette: three clay tones selected by id
+    float3 clayA = float3(0.62, 0.26, 0.16);
+    float3 clayB = float3(0.48, 0.18, 0.11);
+    float3 clayC = float3(0.72, 0.38, 0.22);
+    float3 clayD = float3(0.38, 0.14, 0.09);
+
+    float3 base = clayA;
+    if (r0 > 0.75) base = clayC;
+    else if (r0 > 0.45) base = clayB;
+    else if (r0 < 0.15) base = clayD;
+
+    // Brightness variation per brick
+    base = base * (0.82 + r1 * 0.36);
+
+    // Surface grain — fine noise inside each brick
+    float g1 = noiseT(uv * 220.0, 220.0) - 0.5;
+    float g2 = noiseT(uv * 480.0, 480.0) - 0.5;
+    float grain = g1 * 0.06 + g2 * 0.03;
+
+    // Subtle radial darkening near edges (adds depth to the brick body)
+    float2 c = local - 0.5;
+    float radial = length(c) * 2.0;
+    float bodyDark = 1.0 - smoothstep(0.5, 1.2, radial) * 0.18;
+
+    base = base * bodyDark + grain * float3(0.8, 0.6, 0.5);
+    base = base * (0.9 + r2 * 0.2);
+
+    return base;
+}
+
+float3 mortarColor(float2 uv) {
+    // Mortar is greyish, with its own fine grain
+    float g = noiseT(uv * 350.0, 350.0) - 0.5;
+    float3 base = float3(0.48, 0.45, 0.42);
+    base = base + g * float3(0.2, 0.18, 0.15);
+    return base;
+}
+
+// ============================================================
+//  Height field
+//
+//  Used both for AO and for the tangent-space normal.
+//  Bricks rise above the mortar. A bevel smooths the transition
+//  near the edges of each brick.
+// ============================================================
+
+float heightField(float2 uv) {
+    Brick b = getBrick(uv);
+
+    // Mortar groove depth
+    float mortar = smoothstep(0.0, 0.06, b.edge);
+
+    // Bevel: bricks have a slight chamfer on the top edge
+    float bevel = smoothstep(0.0, 0.10, b.edge);
+
+    // Per-brick height variation
+    float h = 0.5 + b.height * 0.35;
+
+    // Combine: brick body sits at h, mortar drops to 0
+    float height = mix(0.0, h * bevel, mortar);
+
+    return height;
+}
+
+float3 computeNormal(float2 uv, float texel) {
+    // Central differences on the height field
+    float hL = heightField(uv + float2(-texel, 0.0));
+    float hR = heightField(uv + float2( texel, 0.0));
+    float hD = heightField(uv + float2(0.0, -texel));
+    float hU = heightField(uv + float2(0.0,  texel));
+
+    float dx = (hR - hL) * 0.5;
+    float dy = (hU - hD) * 0.5;
+
+    // Scale derivative strength
+    float strength = 8.0;
+    float3 n = normalize(float3(-dx * strength, -dy * strength, 1.0));
+    return n;
+}
+
+// ============================================================
+//  main
+// ============================================================
+
+half4 main(float2 fragCoord) {
+    float2 uv = fragCoord / resolution;
+    uv.y = 1.0 - uv.y;
+
+    // Texel size for the normal computation
+    float texel = 1.0 / min(resolution.x, resolution.y);
+
+    // ---- Brick body ----
+    Brick brick = getBrick(uv);
+
+    // Mortar mask and edge distance
+    float mortarWidth = 0.045;
+    float mortarMask = 1.0 - smoothstep(0.0, mortarWidth, brick.edge);
+
+    float3 bCol = brickColor(brick.cellId, brick.local, uv);
+    float3 mCol = mortarColor(uv);
+
+    float3 albedo = mix(bCol, mCol, mortarMask);
+
+    // ---- Normal ----
+    float3 N = computeNormal(uv, texel);
+
+    // ---- Lighting ----
+    float3 L1 = normalize(float3(0.45, 0.55, 0.70));
+    float3 L2 = normalize(float3(-0.35, 0.25, 0.60));
+    float3 V  = float3(0.0, 0.0, 1.0);
+
+    float ndl1 = max(dot(N, L1), 0.0);
+    float ndl2 = max(dot(N, L2), 0.0);
+
+    float3 warmSun = float3(1.05, 0.92, 0.72);
+    float3 coolFill = float3(0.32, 0.45, 0.65);
+
+    float3 lighting = warmSun * ndl1 + coolFill * ndl2 * 0.55;
+
+    // ---- Ambient occlusion ----
+    // Grooves darker, brick tops brighter
+    float ao = mix(0.30, 1.0, smoothstep(0.0, 0.08, brick.edge));
+
+    // Per-brick AO — bricks in the "mortar shadow" of neighbours
+    float brickAO = 1.0 - mortarMask * 0.55;
+
+    // Ambient tone — cool sky fill
+    float3 ambient = float3(0.28, 0.32, 0.42) * (0.6 + 0.4 * N.y);
+
+    // ---- Final shading ----
+    float3 col = albedo * (lighting + ambient) * ao * brickAO;
+
+    // Rim / edge highlight on the brick's upper bevel
+    float upperEdge = smoothstep(0.0, 0.06, brick.edge)
+                    * (1.0 - smoothstep(0.06, 0.12, brick.edge));
+    float upperMask = smoothstep(0.55, 0.75, brick.local.y);
+    col = col + warmSun * upperEdge * upperMask * 0.10;
+
+    // Specular highlight on wet-ish brick
+    float3 H = normalize(L1 + V);
+    float spec = pow(max(dot(N, H), 0.0), 24.0) * 0.08;
+    col = col + warmSun * spec;
+
+    // ---- Vignette ----
+    float2 vuv = fragCoord / resolution;
+    float vig = vuv.x * vuv.y * (1.0 - vuv.x) * (1.0 - vuv.y);
+    vig = clamp(pow(16.0 * vig, 0.28), 0.0, 1.0);
+    col = col * mix(0.75, 1.0, vig);
+
+    // ---- Tone ----
+    col = pow(max(col, float3(0.0, 0.0, 0.0)), float3(0.92, 0.92, 0.92));
+
+    return half4(half3(clamp(col, float3(0.0, 0.0, 0.0),
+                                  float3(1.0, 1.0, 1.0))), 1.0);
+}

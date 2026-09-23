@@ -1,0 +1,230 @@
+/*
+
+================================================================================
+  Silk Ribbons — tileable procedural texture
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+                 See LICENSE in the project root for the full text.
+
+  This shader is an original work. It was written from scratch for
+  Subless3D and shares no code with any external source.
+
+  The visual idea — layered silk-like ribbons with traveling highlights
+  on a dark backdrop — is a common motif in shader art and is not
+  attributed to any single author.
+
+  Features:
+      * Fully tileable in both axes (period = 1 in UV space)
+      * Four main ribbons, six thin filaments
+      * Periodic traveling sheen that moves along the ribbons
+      * Six gaussian blobs form the background
+      * Slow drift animation that preserves tiling
+
+  How tiling is achieved:
+      * All X-distances use wdiff() — shortest distance on a circle
+        of period 1, so the pattern wraps seamlessly in X.
+      * All Y-curves use sine of (TAU * y), so they have period 1
+        in Y by construction.
+      * Gaussians use wdiff in both axes, so they repeat.
+      * The hue shift is constant per frame — it does not depend on
+        coordinates, so it does not break tiling.
+
+  If you modify this file, keep this header intact to preserve
+  attribution. The Apache 2.0 license allows modification and
+  redistribution; the attribution line is a matter of courtesy,
+  not a legal requirement under Apache 2.0.
+
+================================================================================
+*/
+uniform float2 resolution;
+uniform float time;
+
+const float TAU = 6.28318530718;
+const float DITHER_LEVELS = 1.25;
+
+// ============================================================
+//  Tileable helpers
+// ============================================================
+
+// Shortest signed distance on circle of period 1
+float wdiff(float a, float b) {
+    float d = a - b;
+    return d - floor(d + 0.5);
+}
+
+float wabs(float a, float b) {
+    return abs(wdiff(a, b));
+}
+
+// Periodic curve — period 1 in y
+float curveP(float y, float cx, float amp, float phase) {
+    return cx + amp * sin(TAU * y + phase);
+}
+
+// Wrapped gaussian — periodic in both axes
+float gaussW(float2 p, float2 center, float2 extent) {
+    float dx = wdiff(p.x, center.x) / extent.x;
+    float dy = wdiff(p.y, center.y) / extent.y;
+    return exp(-dx * dx - dy * dy);
+}
+
+// Band between two wrapped x-positions
+float bandMask(float px, float lo, float hi, float aa) {
+    float c = (lo + hi) * 0.5;
+    float hw = (hi - lo) * 0.5;
+    float d = wabs(px, c);
+    return 1.0 - smoothstep(hw - aa, hw + aa, d);
+}
+
+float acrossBand(float px, float lo, float hi) {
+    float c = (lo + hi) * 0.5;
+    float hw = (hi - lo) * 0.5;
+    float d = wdiff(px, c);
+    return clamp(0.5 + d / max(2.0 * hw, 0.001), 0.0, 1.0);
+}
+
+float square(float x) { return x * x; }
+
+float lineLight(float d, float w) {
+    return exp(-abs(d) / w);
+}
+
+// Traveling sheen — periodic in y so it repeats with the tile
+float sheen(float y, float layer, float clock) {
+    float c = 0.50 + 0.66 * sin(clock * 0.47 - layer * 0.80);
+    float w = 0.15 + 0.025 * sin(layer * 1.7 + clock * 0.19);
+    float q = (y - c) / w;
+    return exp(-q * q) * 0.75;
+}
+
+// One ribbon: two periodic edges, band between them
+float3 drawRibbon(
+    float2 p,
+    float baseX,
+    float width,
+    float amp,
+    float phase,
+    float layer,
+    float clock,
+    float3 tintA,
+    float3 tintB,
+    float aa
+) {
+    float left  = curveP(p.y, baseX - width * 0.5, amp,        phase);
+    float right = curveP(p.y, baseX + width * 0.5, amp * 0.85, phase + 1.3);
+
+    float lo = min(left, right);
+    float hi = max(left, right);
+
+    float band = bandMask(p.x, lo, hi, aa);
+    float across = acrossBand(p.x, lo, hi);
+
+    float silk = pow(1.0 - across, 1.7) * 0.8 + 0.12;
+    float light = gaussW(p, float2(baseX, 0.45), float2(0.9, 1.2));
+
+    float3 col = float3(0.0);
+    col = col + band * silk * light * tintA;
+
+    float sheenV = sheen(p.y, layer, clock);
+    float ridge  = exp(-square((across - 0.30) / 0.30));
+    float taper  = 0.5 + 0.5 * cos(TAU * p.y);
+
+    col = col + tintB * band * ridge * sheenV * taper;
+    col = col + float3(0.15, 0.14, 0.11)
+              * lineLight(wabs(p.x, left), max(aa, 0.0012))
+              * sheenV * taper;
+    col = col + tintB * taper * lineLight(wabs(p.x, right), max(aa, 0.0015)) * 0.09;
+
+    return col;
+}
+
+// ============================================================
+//  main
+// ============================================================
+
+half4 main(float2 fragCoord) {
+    float2 uv = fragCoord / resolution;
+    uv.y = 1.0 - uv.y;
+
+    float t = time * 0.09;
+
+    // Slow drift, both axes wrapped
+    float pxf = fract(uv.x + 0.02 * sin(t * 0.7));
+    float pyf = fract(uv.y + 0.015 * sin(t * 0.5));
+    float2 p = float2(pxf, pyf);
+
+    // ---- Background ----
+    float3 col = float3(0.016, 0.025, 0.030);
+
+    col = col + float3(0.12, 0.19, 0.24)
+              * gaussW(p, float2(0.20, 0.30), float2(0.55, 0.45));
+    col = col + float3(0.22, 0.35, 0.44)
+              * gaussW(p, float2(0.55, 0.25), float2(0.35, 0.30));
+    col = col + float3(0.43, 0.43, 0.41)
+              * gaussW(p, float2(0.80, 0.55), float2(0.35, 0.40));
+    col = col + float3(0.15, 0.14, 0.12)
+              * gaussW(p, float2(0.40, 0.75), float2(0.40, 0.35));
+    col = col + float3(0.38, 0.235, 0.11)
+              * gaussW(p, float2(0.05, 0.65), float2(0.30, 0.30));
+    col = col + float3(0.065, 0.038, 0.012)
+              * gaussW(p, float2(0.70, 0.10), float2(0.30, 0.30));
+
+    float aa = 0.7 / resolution.x;
+
+    // ---- Four main ribbons, evenly distributed ----
+    col = col + drawRibbon(p, 0.12, 0.10, 0.05, 0.0, 0.0, t,
+        float3(0.16, 0.125, 0.052), float3(0.115, 0.102, 0.076), aa);
+    col = col + drawRibbon(p, 0.37, 0.08, 0.06, 1.7, 1.0, t,
+        float3(0.14, 0.16, 0.14),  float3(0.10, 0.14, 0.12),  aa);
+    col = col + drawRibbon(p, 0.62, 0.09, 0.04, 3.1, 2.0, t,
+        float3(0.16, 0.13, 0.10),  float3(0.12, 0.10, 0.08),  aa);
+    col = col + drawRibbon(p, 0.87, 0.07, 0.055, 4.5, 3.0, t,
+        float3(0.15, 0.14, 0.13),  float3(0.11, 0.10, 0.09),  aa);
+
+    // ---- Thin filaments between ribbons ----
+    for (int i = 0; i < 6; i++) {
+        float f = float(i);
+        float baseX = f / 6.0 + 0.05;
+        float phase = f * 1.7;
+        float x = curveP(p.y, baseX, 0.03, phase);
+
+        // Wrapped distance, periodic width compensation
+        float wComp = sqrt(1.0 + square(0.3 + 0.3 * sin(TAU * p.y)));
+        float d = wdiff(p.x, x) / wComp;
+
+        float envelope = 0.4 + 0.6 * (0.5 + 0.5 * cos(TAU * p.y + f * 0.7));
+
+        float3 tint = mix(
+            float3(0.72, 0.77, 0.78),
+            float3(1.0, 0.64, 0.24),
+            0.5 + 0.5 * cos(TAU * p.y - 0.5));
+
+        col = col + tint * envelope * 0.55 * lineLight(d, max(aa, 0.00065));
+
+        float glint = sheen(p.y, f * 0.55, t);
+        col = col + tint * glint * envelope * 0.12 * lineLight(d, max(aa, 0.0010));
+    }
+
+    // ---- Constant hue shift per frame (doesn't break tiling) ----
+    float hue = 0.05 * sin(t * 0.22);
+    float3 axis = normalize(float3(1.0, 1.0, 1.0));
+    float ch = cos(hue * 6.2831853);
+    float sh = sin(hue * 6.2831853);
+    float3 shifted = col * ch
+                   + cross(axis, col) * sh
+                   + axis * dot(axis, col) * (1.0 - ch);
+    col = max(shifted, float3(0.0, 0.0, 0.0));
+
+    // ---- Dither ----
+    float2 pixel = floor(fragCoord);
+    float grain = fract(sin(dot(pixel + time * 60.0,
+                                float2(12.9898, 78.233))) * 43758.5453);
+    col = col + (grain * 2.0 - 1.0) * (DITHER_LEVELS / 255.0);
+
+    return half4(half3(clamp(col, float3(0.0, 0.0, 0.0),
+                                  float3(1.0, 1.0, 1.0))), 1.0);
+}

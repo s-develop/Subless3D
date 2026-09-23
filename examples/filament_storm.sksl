@@ -1,0 +1,173 @@
+/*
+
+================================================================================
+  Filament Storm — glowing threads in dark space
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+                 See LICENSE in the project root for the full text.
+
+  Original work. No code shared with any third-party shader.
+
+  Visual:
+      Thin bright filaments of light curl through dark space.
+      Emissive accumulation makes them additively brighten where
+      they overlap. Colors cycle along each filament from deep
+      blue through magenta and amber to warm white.
+
+================================================================================
+*/
+
+uniform float2 resolution;
+uniform float time;
+
+// ============================================================
+//  Hash and value noise
+// ============================================================
+
+float hash21(float2 p) {
+    p = fract(p * float2(0.1031, 0.1030));
+    p = p + dot(p, p.yx + 33.33);
+    return fract((p.x + p.y) * p.x);
+}
+
+float vnoise2(float2 p) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float a = hash21(i);
+    float b = hash21(i + float2(1.0, 0.0));
+    float c = hash21(i + float2(0.0, 1.0));
+    float d = hash21(i + float2(1.0, 1.0));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm2(float2 p) {
+    float v = vnoise2(p);
+    v = (v + 0.5 * vnoise2(p * 2.07 + float2(7.1, 3.3))) / 1.5;
+    return v;
+}
+
+// ============================================================
+//  Ridged field
+//  Low-frequency base ridge modulated by high-frequency detail,
+//  so each thread varies in thickness along its length.
+// ============================================================
+
+float ridgedAt(float2 xy, float z, float t) {
+    float2 off = float2(z * 0.13, z * 0.07);
+    float2 baseP = xy + off + float2(t * 0.10, t * 0.07);
+
+    float n = fbm2(baseP);
+    float r = 1.0 - abs(n - 0.5) * 2.0;
+    r = r * r * r * r * r;
+
+    float detail = vnoise2(baseP * 8.7 + float2(0.0, t * 0.5));
+    r = r * (0.55 + 0.45 * detail);
+
+    return r;
+}
+
+// ============================================================
+//  Palette — deep blue, magenta, amber, warm white
+// ============================================================
+
+float3 palette(float h) {
+    float3 c0 = float3(0.08, 0.14, 0.65);
+    float3 c1 = float3(0.70, 0.15, 0.75);
+    float3 c2 = float3(0.95, 0.50, 0.15);
+    float3 c3 = float3(1.00, 0.92, 0.80);
+
+    float u = fract(h) * 3.0;
+    float3 col = c0;
+    if (u < 1.0) {
+        col = mix(c0, c1, u);
+    } else if (u < 2.0) {
+        col = mix(c1, c2, u - 1.0);
+    } else {
+        col = mix(c2, c3, u - 2.0);
+    }
+    return col;
+}
+
+// ============================================================
+//  ACES tone mapping
+// ============================================================
+
+float3 aces(float3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e),
+                 float3(0.0), float3(1.0));
+}
+
+// ============================================================
+//  main
+// ============================================================
+
+half4 main(float2 fragCoord) {
+    float2 uv = (fragCoord - 0.5 * resolution) / resolution.y;
+
+    float3 rd = normalize(float3(uv, 1.0));
+    float t = time;
+
+    float3 accum = float3(0.0);
+
+    const int STEPS = 20;
+    const float STEP_SIZE = 0.26;
+
+    for (int i = 0; i < STEPS; i++) {
+        float fi = float(i);
+        float tRay = (fi + 0.5) * STEP_SIZE;
+
+        float2 xy = rd.xy * tRay * 1.30;
+        float z = tRay - t * 0.40;
+
+        float r = ridgedAt(xy, z, t);
+
+        float emit = smoothstep(0.30, 0.90, r);
+
+        float rxy = length(xy * 0.50);
+        emit = emit * exp(-rxy * rxy * 0.28);
+
+        float hue = z * 0.09 + t * 0.03 + xy.x * 0.04;
+        float3 tint = palette(hue);
+
+        float core = smoothstep(0.82, 0.99, r);
+        tint = mix(tint, float3(1.0, 0.96, 0.90), core * 0.55);
+
+        accum = accum + emit * tint * STEP_SIZE * 1.05;
+    }
+
+    float3 bg = mix(float3(0.006, 0.008, 0.022),
+                    float3(0.014, 0.010, 0.032),
+                    0.5 - uv.y * 0.5);
+
+    float3 sd = normalize(rd);
+    float3 sCell = floor(sd * 260.0);
+    float sSeed = hash21(sCell.xy + float2(sCell.z * 19.0, sCell.z * 27.0));
+    float star = step(0.9980, sSeed);
+    float tw = 0.7 + 0.3 * sin(t * 3.1 + sSeed * 400.0);
+
+    float3 col = accum + bg + star * float3(0.92, 0.88, 1.00) * 1.2 * tw;
+
+    float bright = dot(col, float3(0.299, 0.587, 0.114));
+    float edge = length(uv);
+    col.r = col.r * (1.0 + bright * 0.06 + edge * 0.06);
+    col.b = col.b * (1.0 + bright * 0.04 + edge * 0.10);
+
+    col = aces(col * 1.05);
+
+    float vig = 1.0 - smoothstep(0.55, 1.50, edge);
+    col = col * mix(0.50, 1.0, vig);
+
+    col = pow(max(col, float3(0.0)), float3(0.95));
+
+    return half4(half3(clamp(col, float3(0.0), float3(1.0))), 1.0);
+}

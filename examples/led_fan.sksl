@@ -1,0 +1,271 @@
+/*
+
+================================================================================
+  LED Fan — procedural cooling fan with animated LED ring
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+                 See LICENSE in the project root for the full text.
+
+  This is an original work. It was written from scratch and shares no
+  code with any third-party source.
+
+  Description:
+      Top-down view of a computer cooling fan. Features:
+        * Seven curved blades with a subtle metallic gradient
+        * Rotating animation with configurable speed
+        * Concentric LED ring with a running-chase pattern
+        * Counter-rotating dot layer for depth
+        * Chromatic color cycling through the LED spectrum
+        * Center hub with a brushed-metal highlight
+        * Outer frame ring
+
+  Coordinate system:
+      uv is centered on the fan and normalized so the fan radius is 1.
+      r  — radial distance from center
+      a  — angle from +X axis, in radians
+
+  Note on SkSL compatibility:
+      * atan(y, x) is used for the angle instead of atan2
+      * mod() is used instead of % operator
+      * All branching that touches color goes through mix() or smoothstep()
+      * No integer division or bit operations
+      * Explicit half4/half3 at the return boundary
+
+================================================================================
+*/
+
+uniform float2 resolution;
+uniform float time;
+
+const float PI  = 3.14159265359;
+const float TAU = 6.28318530718;
+
+// ============================================================
+//  Hashes
+// ============================================================
+
+float hash21(float2 p) {
+    return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453123);
+}
+
+float hash11(float x) {
+    return fract(sin(x * 78.233) * 43758.5453123);
+}
+
+// ============================================================
+//  Palette
+//
+//  Smooth hue-cycling color. The three offsets give R, G, B
+//  phases; the result is clamped to [0, 1].
+// ============================================================
+
+float3 palette(float t) {
+    // Three anchor colors — full saturation, no pastel mixing
+    float3 red   = float3(1.00, 0.10, 0.10);
+    float3 green = float3(0.10, 1.00, 0.25);
+    float3 blue  = float3(0.15, 0.30, 1.00);
+
+    // Wrap t to [0, 1)
+    float u = fract(t);
+
+    // Three-way blend across a circle
+    float3 col;
+    if (u < 0.3333) {
+        float k = u / 0.3333;
+        col = mix(red, green, k);
+    } else if (u < 0.6666) {
+        float k = (u - 0.3333) / 0.3333;
+        col = mix(green, blue, k);
+    } else {
+        float k = (u - 0.6666) / 0.3334;
+        col = mix(blue, red, k);
+    }
+
+    // Push saturation up further by removing the grey component
+    float lum = dot(col, float3(0.299, 0.587, 0.114));
+    col = col + (col - float3(lum, lum, lum)) * 0.6;
+
+    return clamp(col, float3(0.0), float3(1.0));
+}
+// ============================================================
+//  Anti-aliased ring
+//
+//  Returns coverage of a thin annulus centered at radius `r0`
+//  with half-thickness `w`, anti-aliased over `aa` pixels.
+// ============================================================
+
+float ringAA(float r, float r0, float w, float aa) {
+    float d = abs(r - r0);
+    return 1.0 - smoothstep(w - aa, w + aa, d);
+}
+
+// ============================================================
+//  Blade pattern
+//
+//  Seven curved blades. Each blade is a smoothstep band on the
+//  sin() of a warped angular coordinate. r-dependent warping
+//  makes the blades curve as they travel outward.
+// ============================================================
+
+float bladePattern(float r, float a, float t, float blades) {
+    // Angular warp: blades curve with radius and rotate over time
+    float warped = a + t * 8.0 + r * 1.8;
+
+    // Blade profile — 7 blades over a full turn
+    float b = sin(warped * blades);
+
+    // Sharp, maskable shape
+    b = smoothstep(-0.55, 0.90, b);
+
+    // Radial envelope — fade blades in near the hub and out near the rim
+    float rIn  = smoothstep(0.14, 0.24, r);
+    float rOut = smoothstep(0.47, 0.41, r);
+
+    return b * rIn * rOut;
+}
+
+
+// ============================================================
+//  LED ring — saturated animated lights
+// ============================================================
+
+float3 ledRing(float r, float a, float t) {
+    // --- Concentric rings ---
+    float rings = sin(r * 110.0);
+    rings = smoothstep(0.80, 0.98, rings);
+
+    // --- Counter-rotating dots ---
+    float dots = sin(a * 32.0 - t * 15.0 + r * 10.0);
+    dots = smoothstep(0.30, 0.90, dots);
+
+    // --- Combined brightness field ---
+    float ledGlow = rings * dots;
+
+    // --- Hue from angle + time ---
+    float3 ledColor = palette(a / TAU + t * 0.15);
+
+    // --- Inner ring accent ---
+    float centerRing = smoothstep(0.02, 0.0, abs(r - 0.14));
+
+    // --- Outer frame accent ---
+    float outerFrame = smoothstep(0.008, 0.0, abs(r - 0.46));
+
+    // --- Final LED sum, brighter than before ---
+    float3 finalLED =
+        ledGlow    * ledColor * 5.5 +     // было 3.5
+        centerRing * ledColor * 2.2 +     // было 1.5
+        outerFrame * ledColor * 1.2;      // было 0.8
+
+    // --- Fine sparkle on the active LEDs ---
+    finalLED = finalLED + hash21(float2(a, r) + t) * ledGlow * 0.3;
+
+    return finalLED;
+}
+
+// ============================================================
+//  Blade surface — brushed metal
+// ============================================================
+
+float3 bladeSurface(float r, float a, float t, float b) {
+    // Base metallic grey, slightly cooler near the rim
+    float3 blade = float3(0.30, 0.32, 0.37);
+
+    // Radial gradient — brighter mid-blade, darker at the edges
+    float mid = smoothstep(0.20, 0.35, r) * smoothstep(0.48, 0.38, r);
+    blade = blade * (0.6 + 0.4 * mid);
+
+    // Angular brushed streaks
+    float streaks = sin(a * 60.0 + r * 8.0 + t * 1.5) * 0.5 + 0.5;
+    blade = blade + streaks * 0.05;
+
+    // Highlight along the leading edge of each blade
+    float leading = sin((a + t * 8.0 + r * 1.8) * 7.0);
+    leading = smoothstep(0.85, 1.0, leading);
+    blade = blade + float3(0.40, 0.42, 0.48) * leading * b * 0.6;
+
+    // Blade shading — blades darker than gaps
+    blade = blade * (0.55 + 0.45 * b);
+
+    return blade;
+}
+
+// ============================================================
+//  Center hub
+// ============================================================
+
+float3 hubSurface(float2 uv, float r, float t) {
+    // Dark base
+    float3 hub = float3(0.04, 0.04, 0.06);
+
+    // Brushed-metal highlight: rotating two-branch streak
+    float c = cos(t * 8.0);
+    float s = sin(t * 8.0);
+    float2 rotUV = float2(c * uv.x - s * uv.y, s * uv.x + c * uv.y);
+
+    float streak = smoothstep(0.035, 0.0, abs(rotUV.x - rotUV.y * 0.30));
+    streak = streak * smoothstep(0.13, 0.0, r);
+    hub = hub + float3(0.14, 0.15, 0.18) * streak;
+
+    // Thin bright rim at the hub edge
+    float hubRim = smoothstep(0.010, 0.0, abs(r - 0.125));
+    hub = hub + float3(0.22, 0.24, 0.30) * hubRim;
+
+    return hub;
+}
+
+// ============================================================
+//  main
+// ============================================================
+
+half4 main(float2 fragCoord) {
+    // Centered UV with radius normalized to 1 at the fan rim
+    float2 uv = (fragCoord - 0.5 * resolution) / resolution.y;
+
+    float r = length(uv);
+    float a = atan(uv.y, uv.x);
+
+    // Pixel size in the same units — for anti-aliasing
+    float aa = 1.5 / resolution.y;
+
+    // Outside the fan — dark background
+    if (r > 0.48) {
+        return half4(0.005, 0.005, 0.010, 1.0);
+    }
+
+    float t = time;
+
+    // ---- Blades ----
+    float blades = bladePattern(r, a, t, 7.0);
+    float3 col = bladeSurface(r, a, t, blades);
+
+    // ---- LED ring ----
+    float3 leds = ledRing(r, a, t);
+    col = col + leds * (0.45 + blades * 0.85);
+
+    // ---- Hub ----
+    float hubMask = smoothstep(0.130, 0.120, r);
+    float3 hub = hubSurface(uv, r, t);
+    col = mix(col, hub, hubMask);
+
+    // ---- Outer rim ----
+    float outerRim = ringAA(r, 0.465, 0.010, aa);
+    col = col + float3(0.20, 0.22, 0.26) * outerRim * 0.8;
+
+    // ---- Soft rim shadow toward the background ----
+    float edgeFade = smoothstep(0.48, 0.44, r);
+    col = col * edgeFade;
+
+    // ---- Anti-aliased mask against the background ----
+    float insideMask = 1.0 - smoothstep(0.470, 0.478, r);
+    col = col * insideMask;
+
+    // ---- Filmic lift + slight tone ----
+    col = pow(max(col, float3(0.0, 0.0, 0.0)), float3(0.88, 0.88, 0.88));
+
+    return half4(half3(clamp(col, float3(0.0, 0.0, 0.0),
+                                  float3(1.0, 1.0, 1.0))), 1.0);
+}

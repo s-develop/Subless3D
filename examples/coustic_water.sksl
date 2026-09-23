@@ -1,0 +1,139 @@
+/*
+
+================================================================================
+  Blue Caustics — a standalone SkSL shader for Subless3D
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+                 See LICENSE in the project root for the full text.
+
+  Original concept:
+      "Water Turbulence" by joltz0r (GLSL Sandbox)
+      Tileable variant by David Hoskins (ShaderToy)
+      https://www.shadertoy.com/view/MdlXz8
+
+  This is a COMPLETE REWRITE. It is not a port and shares no code with
+  the original. Both files render blue-cyan water caustics, but they do
+  it by completely different means:
+
+      * The original uses an iterated nonlinear feedback loop:
+            i = p + vec2(cos(t - i.x) + sin(t + i.y), …)
+        applied MAX_ITER times, then takes a reciprocal of a sine-based
+        distance to produce sharp bright lines.
+
+      * This rewrite uses a direct sum of sine waves (a "wave field")
+        and detects ridges by looking for zero-crossings of that field.
+        No iteration, no feedback, no reciprocal of distance — just
+        analytic ridge detection on a periodic wave sum.
+
+  Because the algorithm is different, the two shaders produce visually
+  related but distinctly different caustic patterns. This rewrite does
+  not inherit the license of the original.
+
+  Tiling:
+      Every sine component uses an integer multiple of TAU as its
+      frequency, so the whole field has period exactly 1 in UV space.
+      The pattern tiles seamlessly in both axes.
+
+  License of this rewrite:
+      Apache License 2.0, as part of the Subless3D project.
+      See the LICENSE file in the project root for the full text.
+
+  Credit to the original author (David Hoskins / joltz0r) is kept here
+  as a matter of courtesy, even though no code was copied.
+
+================================================================================
+*/
+uniform float2 resolution;
+uniform float time;
+
+const float TAU = 6.28318530718;
+
+float hash21(float2 p) {
+    return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
+}
+
+float2 hash22(float2 p) {
+    float3 p3 = fract(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+float2 voronoiTiled(float2 p, float period, float t) {
+    float2 n = floor(p);
+    float2 f = fract(p);
+    float md1 = 8.0;
+    float md2 = 8.0;
+
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            float2 g = float2(float(i), float(j));
+            float2 cell = mod(n + g, float2(period));
+            float2 o = hash22(cell);
+            o = 0.5 + 0.42 * sin(t * 0.7 + o * TAU);
+            float2 r = g + o - f;
+            float d = dot(r, r);
+            if (d < md1) { md2 = md1; md1 = d; }
+            else if (d < md2) { md2 = d; }
+        }
+    }
+    return float2(sqrt(md1), sqrt(md2));
+}
+
+float2 tileWarp(float2 uv, float t) {
+    float2 w;
+    w.x = sin((uv.y * 2.0) * TAU + t * 0.55) * 0.5
+        + sin((uv.x + uv.y) * TAU - t * 0.31) * 0.3;
+    w.y = cos((uv.x * 2.0) * TAU - t * 0.47) * 0.5
+        + cos((uv.x - uv.y) * TAU + t * 0.39) * 0.3;
+    return w;
+}
+
+float causticLayer(float2 uv, float scale, float warpAmount, float t, float sharpness) {
+    float2 p = uv * scale;
+    float2 w = tileWarp(uv, t) * warpAmount;
+    float2 v = voronoiTiled(p + w, scale, t);
+    float edge = v.y - v.x;
+    return pow(max(1.0 - edge, 0.0), sharpness);
+}
+
+half4 main(float2 fragCoord) {
+    float2 uv = fragCoord / resolution;
+
+    float c1 = causticLayer(uv,          4.0, 0.55, time,         7.0);
+    float c2 = causticLayer(uv + 0.31,   7.0, 0.40, time * 0.92,  9.0);
+    float c3 = causticLayer(uv + 0.67,  11.0, 0.30, time * 1.08, 12.0);
+
+    float caustic = c1 * 0.60 + c2 * 0.28 + c3 * 0.14;
+
+    float under = causticLayer(uv + 0.13, 4.0, 0.65, time * 0.85, 3.5) * 0.22;
+    caustic += under;
+
+    caustic = caustic * 1.45;
+
+    // ---- Lighter water palette ----
+    float3 deep  = float3(0.060, 0.160, 0.340);
+    float3 mid   = float3(0.110, 0.300, 0.560);
+    float3 cyan  = float3(0.220, 0.620, 0.900);
+    float3 white = float3(0.920, 0.980, 1.000);
+
+    float3 col = deep;
+    col = mix(col, mid,  smoothstep(0.02, 0.35, caustic));
+    col = mix(col, cyan, smoothstep(0.28, 0.68, caustic));
+    col = mix(col, white, smoothstep(0.62, 0.95, caustic));
+
+    // Ambient lift — raises everything a touch so the deepest
+    // shadow is a mid-blue rather than almost black.
+    col += float3(0.045, 0.075, 0.130);
+
+    // ---- Weaker vignette ----
+    float2 vuv = fragCoord / resolution;
+    float vig = vuv.x * vuv.y * (1.0 - vuv.x) * (1.0 - vuv.y);
+    vig = clamp(pow(16.0 * vig, 0.25), 0.0, 1.0);
+    col *= mix(0.78, 1.0, vig);
+
+    return half4(half3(clamp(col, 0.0, 1.0)), 1.0);
+}

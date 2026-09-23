@@ -1,0 +1,170 @@
+/*
+
+================================================================================
+  Low-Poly Ground — procedural terrain texture
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+                 See LICENSE in the project root for the full text.
+
+  This is an original work written from scratch. It shares no code with
+  any third-party shader.
+
+  Description:
+      A stylized low-poly ground texture built from Voronoi cells.
+      Each cell is a flat-shaded polygon with its own colour drawn from
+      an earthy palette (dark soil, clay, sand, stone). Neighbouring
+      cells differ in tone, brightness and surface normal, which gives
+      the characteristic faceted look of low-poly artwork.
+
+  How it works:
+
+      * Voronoi partition — a 5×5 neighbourhood search finds the two
+        closest cell centres. The nearest centre determines the cell
+        id; the difference between first and second distances gives
+        the distance to the cell border.
+
+      * Per-cell colour — cell id is hashed to pick one of four
+        palette tones: base earth, light clay, dark soil, grey stone.
+
+      * Height field — a smooth function of the cell id, used to
+        compute a fake normal by finite differences between adjacent
+        cells. This gives flat-shaded facets that catch the light
+        differently from cell to cell.
+
+      * Face normal — combines the Voronoi centre direction, the
+        height gradient, and a per-cell random jitter.
+
+      * Lighting — a single warm directional light plus a rim
+        term along grazing angles. Ambient occlusion darkens the
+        cell interiors, crack shadow darkens the borders.
+
+      * Organic details — moss masks and crevice darkening at the
+        cell edges add variation without breaking the low-poly
+        flat-shaded aesthetic.
+
+  Coordinate space:
+      uv is centered on the screen and scaled so the grid of cells
+      covers a useful range. The vertical component drifts slowly
+      over time, which makes the terrain appear to scroll.
+
+  Note on SkSL compatibility:
+      * All color composition uses mix() and smoothstep(); no
+        branching inside the color pipeline.
+      * Struct-free, no integer types, no bit operations.
+      * Explicit half4/half3 at the return boundary.
+
+================================================================================
+*/
+
+uniform float2 resolution;
+uniform float time;
+
+
+float hash21(float2 p) {
+    return fract(sin(dot(p, float2(12.9898, 78.233))) * 43758.5453);
+}
+
+float2 hash22(float2 p) {
+    float3 p3 = fract(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+half4 main(float2 fragCoord) {
+    float2 uv = (fragCoord - 0.5 * resolution) / resolution.y;
+    uv *= 8.0;
+    uv.y += time * 0.1;
+
+    float2 p = floor(uv);
+    float2 f = fract(uv);
+
+    float minDist = 9.0;
+    float secondDist = 9.0;
+    float2 centerPoint = float2(0.0);
+    float2 cellId = float2(0.0);
+
+    for (int j = -2; j <= 2; j++) {
+        for (int i = -2; i <= 2; i++) {
+            float2 neighbor = float2(float(i), float(j));
+            float2 point = hash22(p + neighbor);
+            point = 0.5 + 0.4 * sin(time * 0.2 + point * 6.2831);
+
+            float2 diff = neighbor + point - f;
+            float d = dot(diff, diff);
+
+            if (d < minDist) {
+                secondDist = minDist;
+                minDist = d;
+                centerPoint = diff;
+                cellId = p + neighbor;
+            } else if (d < secondDist) {
+                secondDist = d;
+            }
+        }
+    }
+
+    float edgeDist = sqrt(secondDist) - sqrt(minDist);
+    float cellDist = sqrt(minDist);
+
+    float colorNoise = hash21(cellId);
+    float colorNoise2 = hash21(cellId + 13.7);
+
+    float3 groundColor = float3(0.38, 0.24, 0.15);
+    if (colorNoise > 0.75) {
+        groundColor = float3(0.48, 0.32, 0.20);
+    } else if (colorNoise < 0.25) {
+        groundColor = float3(0.28, 0.18, 0.12);
+    } else if (colorNoise > 0.5 && colorNoise < 0.6) {
+        groundColor = float3(0.40, 0.38, 0.35);
+    }
+
+    float height = sin(cellId.x * 0.5) * cos(cellId.y * 0.5) * 0.4 + colorNoise * 0.2;
+
+    float hXp = sin((cellId.x + 1.0) * 0.5) * cos(cellId.y * 0.5) * 0.4
+              + hash21(cellId + float2(1.0, 0.0)) * 0.2;
+    float hYp = sin(cellId.x * 0.5) * cos((cellId.y + 1.0) * 0.5) * 0.4
+              + hash21(cellId + float2(0.0, 1.0)) * 0.2;
+
+    float3 faceNormal = normalize(float3(centerPoint.x, centerPoint.y, 0.5));
+    float3 heightNormal = normalize(float3(
+        (height - hXp) * 3.0,
+        (height - hYp) * 3.0,
+        1.0
+    ));
+
+    float3 normal = normalize(faceNormal * 0.7 + heightNormal * 0.6);
+
+    float3 randomNormalMod = float3(hash22(cellId) - 0.5, 0.0) * 0.6;
+    normal = normalize(normal + randomNormalMod);
+
+    float3 lightDir = normalize(float3(0.5, 0.7, 1.0));
+    float diffuse = max(dot(normal, lightDir), 0.0);
+
+    float rim = 1.0 - max(dot(normal, float3(0.0, 0.0, 1.0)), 0.0);
+    rim = smoothstep(0.4, 0.7, rim) * 0.15;
+
+    float ao = clamp(cellDist * 1.4, 0.4, 1.0);
+    float crack = smoothstep(0.02, 0.10, edgeDist);
+    float crackShadow = mix(0.45, 1.0, crack);
+
+    float3 finalColor = groundColor * (diffuse * 1.1 + 0.3);
+    finalColor *= ao * crackShadow;
+    finalColor += float3(0.5, 0.45, 0.35) * rim;
+
+    float crevice = smoothstep(0.06, 0.0, edgeDist);
+    finalColor = mix(finalColor, finalColor * 0.55, crevice * 0.7);
+
+    float mossMask = smoothstep(0.70, 0.85, colorNoise2);
+    finalColor = mix(finalColor, finalColor * float3(0.75, 1.05, 0.70), mossMask * 0.3);
+
+    float2 target_uv = fragCoord / resolution;
+    float vignette = target_uv.x * target_uv.y * (1.0 - target_uv.x) * (1.0 - target_uv.y);
+    vignette = clamp(pow(16.0 * vignette, 0.25), 0.0, 1.0);
+    finalColor *= mix(0.6, 1.0, vignette);
+
+    return half4(half3(clamp(finalColor, 0.0, 1.0)), 1.0);
+}

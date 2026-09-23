@@ -1,0 +1,157 @@
+/*
+
+================================================================================
+  Neon Circuit — glowing PCB traces with running pulses
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+                 See LICENSE in the project root for the full text.
+
+  Original work. No code shared with any third-party shader.
+
+  Visual reference:
+      Circuit board pattern with neon traces and electrical pulses.
+      Inspired by the style of circuit automata created by nayk https://www.shadertoy.com/view/s3d3Dl
+      (not a port — independent implementation).
+
+================================================================================
+*/
+
+uniform float2 resolution;
+uniform float time;
+
+// ============================================================
+//  Hash
+// ============================================================
+
+float hash21(float2 p) {
+    p = fract(p * float2(0.1031, 0.11369));
+    p += dot(p, p.yx + 19.19);
+    return fract(p.x * p.y);
+}
+
+// ============================================================
+//  Distance to line segment
+// ============================================================
+
+float lineDist(float2 p, float2 a, float2 b) {
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float h = clamp(dot(pa, ba) / max(dot(ba, ba), 1e-6), 0.0, 1.0);
+    return length(pa - ba * h);
+}
+
+// ============================================================
+//  Circuit layer
+//
+//  Each cell is a crossing. Traces go from the cell centre to
+//  one or more edges, chosen by hash. Bright pulses travel along
+//  the traces, animated by time.
+//
+//  Returns: mask (trace visibility), pulse (running light)
+// ============================================================
+
+float2 circuitLayer(float2 uv, float scale, float2 scrollSpeed, float seed, float threshold) {
+    uv = uv * scale + time * scrollSpeed + seed;
+
+    float2 id = floor(uv);
+    float2 gv = fract(uv) - 0.5;
+
+    // Neighbour hashes — determines which directions have traces
+    float hR = hash21(id + float2(1.0, 0.0));
+    float hL = hash21(id + float2(-1.0, 0.0));
+    float hT = hash21(id + float2(0.0, 1.0));
+    float hB = hash21(id + float2(0.0, -1.0));
+    float hC = hash21(id);
+
+    float mask = 0.0;
+    float pulse = 0.0;
+
+    float width = 0.06;
+    float2 center = float2(0.0);
+
+    // Right trace
+    if (hC > threshold && hR > threshold) {
+        float d = lineDist(gv, center, float2(0.5, 0.0));
+        float m = smoothstep(width, width - 0.015, d);
+        mask = max(mask, m);
+        // Pulse travels along the trace
+        float pulsePos = fract(gv.x * 1.5 + time * scrollSpeed.x * 3.0);
+        float p = smoothstep(0.12, 0.0, abs(pulsePos - 0.5)) * m;
+        pulse = max(pulse, p);
+    }
+
+    // Left trace
+    if (hC > threshold && hL > threshold) {
+        float d = lineDist(gv, center, float2(-0.5, 0.0));
+        float m = smoothstep(width, width - 0.015, d);
+        mask = max(mask, m);
+        float pulsePos = fract(-gv.x * 1.5 + time * scrollSpeed.x * 3.0);
+        float p = smoothstep(0.12, 0.0, abs(pulsePos - 0.5)) * m;
+        pulse = max(pulse, p);
+    }
+
+    // Top trace
+    if (hC > threshold && hT > threshold) {
+        float d = lineDist(gv, center, float2(0.0, 0.5));
+        float m = smoothstep(width, width - 0.015, d);
+        mask = max(mask, m);
+        float pulsePos = fract(gv.y * 1.5 + time * scrollSpeed.y * 3.0);
+        float p = smoothstep(0.12, 0.0, abs(pulsePos - 0.5)) * m;
+        pulse = max(pulse, p);
+    }
+
+    // Bottom trace
+    if (hC > threshold && hB > threshold) {
+        float d = lineDist(gv, center, float2(0.0, -0.5));
+        float m = smoothstep(width, width - 0.015, d);
+        mask = max(mask, m);
+        float pulsePos = fract(-gv.y * 1.5 + time * scrollSpeed.y * 3.0);
+        float p = smoothstep(0.12, 0.0, abs(pulsePos - 0.5)) * m;
+        pulse = max(pulse, p);
+    }
+
+    return float2(mask, pulse);
+}
+
+// ============================================================
+//  main
+// ============================================================
+
+half4 main(float2 fragCoord) {
+    float2 uv = (fragCoord - 0.5 * resolution) / resolution.y;
+
+    // Two layers at different scales and speeds
+    float2 front = circuitLayer(uv, 22.0, float2(0.015, 0.10), 0.0, 0.56);
+    float2 back  = circuitLayer(uv, 42.0, float2(0.008, 0.06), 5.5, 0.50);
+
+    float3 finalColor = float3(0.003, 0.001, 0.006);
+
+    // Back layer — purple / magenta
+    float3 backColor = back.x * float3(0.25, 0.0, 0.45);
+    backColor += back.y * float3(0.9, 0.1, 0.6) * 1.5;
+
+    // Front layer — cyan / blue
+    float3 frontColor = front.x * float3(0.0, 0.2, 0.45);
+    frontColor += front.y * float3(0.3, 0.85, 1.0) * 2.2;
+
+    // Blend — front covers back where traces exist
+    float frontAlpha = smoothstep(0.0, 0.1, front.x + front.y);
+    finalColor = mix(backColor, frontColor, frontAlpha);
+
+    // Soft bloom
+    finalColor += front.y * float3(0.0, 0.35, 0.8) * 0.4;
+    finalColor += back.y * float3(0.4, 0.0, 0.5) * 0.3;
+
+    // Vignette
+    float vig = 1.0 - smoothstep(0.3, 1.2, length(uv));
+    finalColor *= vig;
+
+    // Gamma
+    finalColor = pow(max(finalColor, float3(0.0)), float3(0.85));
+
+    return half4(half3(clamp(finalColor, 0.0, 1.0)), 1.0);
+}

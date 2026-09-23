@@ -1,0 +1,329 @@
+/*
+
+================================================================================
+  Amber Nebula with Plexus — volumetric clouds and constellation network
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+
+  Original work. No code shared with any third-party shader.
+
+  Visual:
+      Warm amber nebula recedes into the distance. A dense plexus
+      network of glowing dots, connecting lines and triangular
+      clusters floats in front, drifting past the camera in several
+      parallax layers. Sparkles flash at the nodes.
+
+  Method:
+
+      * Nebula — five z-slices of value-noise FBM marched along the
+        view ray. Each slice is domain-warped by two levels of FBM
+        to produce the tangled curls of interstellar gas. Slices
+        accumulate additively with transmittance so nearer layers
+        dim farther ones.
+
+      * Plexus — a 3x3 neighbourhood of animated points per pixel.
+        From the nine points, the five nearest are selected and
+        pairwise connected if they are close enough; three mutually
+        close points automatically form a triangle. Each point
+        also gets a bounded gaussian sparkle. Multiple layers at
+        different scales provide parallax.
+
+  SkSL notes:
+      * No simplex noise. Value noise with smoothstep interpolation.
+      * No texture lookups, no bit operators, no variable array index.
+      * Explicit half4 at the return boundary.
+
+================================================================================
+*/
+
+uniform float2 resolution;
+uniform float time;
+
+// ============================================================
+//  Hash and value noise
+// ============================================================
+
+float hash21(float2 p) {
+    p = fract(p * float2(0.1031, 0.1030));
+    p = p + dot(p, p.yx + 33.33);
+    return fract((p.x + p.y) * p.x);
+}
+
+float hash11(float x) {
+    return fract(sin(x * 78.233) * 43758.5453);
+}
+
+float vnoise(float2 p) {
+    float2 i = floor(p);
+    float2 f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+
+    float a = hash21(i);
+    float b = hash21(i + float2(1.0, 0.0));
+    float c = hash21(i + float2(0.0, 1.0));
+    float d = hash21(i + float2(1.0, 1.0));
+
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+float fbm5(float2 p) {
+    float v = 0.0;
+    float a = 0.5;
+    float tot = 0.0;
+    for (int i = 0; i < 5; i++) {
+        v = v + a * vnoise(p);
+        tot = tot + a;
+        p = p * 2.07 + float2(9.1, 4.3);
+        a = a * 0.5;
+    }
+    return v / max(tot, 1e-5);
+}
+
+// ============================================================
+//  Nebula
+//
+//  Ray direction from screen UV, camera flies forward. Five z-slices
+//  of domain-warped noise accumulate along the ray. Transmittance
+//  makes nearer slices hide further ones.
+// ============================================================
+
+float3 nebula(float2 uv, float t) {
+    float3 fwd = normalize(float3(0.02, 0.01, 1.0));
+    float3 rgt = normalize(cross(float3(0.0, 1.0, 0.0), fwd));
+    float3 upv = cross(fwd, rgt);
+
+    float aspect = resolution.x / resolution.y;
+    float2 s = (uv - 0.5) * float2(aspect, 1.0);
+    float3 rd = normalize(fwd + rgt * s.x * 0.75 + upv * s.y * 0.75);
+
+    float3 ro = fwd * (t * 5.0 + 900.0);
+
+    float3 col = float3(0.0);
+    float trans = 1.0;
+    const float LAYER = 9.0;
+
+    for (int i = 0; i < 5; i++) {
+        float fi = float(i);
+        float zP = 1.0 - fract(ro.z / LAYER);
+        float tRay = (zP + fi) * LAYER / max(rd.z, 0.02);
+        float3 p = ro + rd * tRay;
+
+        // Domain warp
+        float2 q = p.xy * 0.030;
+        float2 w1 = float2(
+            fbm5(q + float2(t * 0.05, 0.0)),
+            fbm5(q + float2(7.1, 2.9) + float2(0.0, t * 0.04))
+        );
+        float2 w2 = float2(
+            fbm5(q + (w1 - 0.5) * 1.30 + float2(t * 0.03, 0.0)),
+            fbm5(q + (w1 - 0.5) * 1.30 + float2(5.3, 8.7))
+        );
+        float d = fbm5(q + (w2 - 0.5) * 1.00);
+        d = smoothstep(0.42, 0.72, d);
+
+        // Edge fade on the outer slices
+        float edge = 1.0;
+        if (i == 0) { edge = 1.0 - fract(ro.z / LAYER); }
+        else if (i == 4) { edge = fract(ro.z / LAYER); }
+        edge = clamp(edge * 1.6, 0.0, 1.0);
+
+        // Amber palette
+        float3 tint = mix(
+            float3(0.30, 0.16, 0.06),
+            float3(0.95, 0.62, 0.28),
+            smoothstep(0.20, 0.90, d)
+        );
+
+        float c = d * edge;
+        col = col + trans * c * tint * 2.0;
+        trans = trans * (1.0 - c * 0.55);
+    }
+
+    // Cool deep-space base
+    col = col + float3(0.015, 0.010, 0.020) * (1.0 - trans);
+    return col;
+}
+
+// ============================================================
+//  Plexus — one layer
+//
+//  For each pixel: find the five nearest points among a 3x3
+//  neighbourhood. Connect them pairwise if the pair distance is
+//  below a threshold. Triangulation emerges automatically when
+//  three points are mutually close. A gaussian sparkle is drawn
+//  at each selected point.
+// ============================================================
+
+float2 cellPoint(float2 cell, float t, float ph) {
+    float2 h = float2(hash21(cell + ph), hash21(cell + ph + 17.3));
+    return 0.5 + 0.36 * float2(
+        sin(t * 0.55 + 6.2831 * h.x),
+        cos(t * 0.48 + 6.2831 * h.y)
+    );
+}
+
+float plexusLayer(float2 uv, float t, float ph) {
+    float2 id = floor(uv);
+    float2 gv = fract(uv);
+
+    // Track 5 nearest points
+    float2 pA = float2(0.0); float dA = 100.0;
+    float2 pB = float2(0.0); float dB = 100.0;
+    float2 pC = float2(0.0); float dC = 100.0;
+    float2 pD = float2(0.0); float dD = 100.0;
+    float2 pE = float2(0.0); float dE = 100.0;
+
+    for (int j = -1; j <= 1; j++) {
+        for (int i = -1; i <= 1; i++) {
+            float2 off = float2(float(i), float(j));
+            float2 pt = cellPoint(id + off, t, ph) + off;
+            float d = length(gv - pt);
+
+            if (d < dA) {
+                dE = dD; pE = pD;
+                dD = dC; pD = pC;
+                dC = dB; pC = pB;
+                dB = dA; pB = pA;
+                dA = d;  pA = pt;
+            } else if (d < dB) {
+                dE = dD; pE = pD;
+                dD = dC; pD = pC;
+                dC = dB; pC = pB;
+                dB = d;  pB = pt;
+            } else if (d < dC) {
+                dE = dD; pE = pD;
+                dD = dC; pD = pC;
+                dC = d;  pC = pt;
+            } else if (d < dD) {
+                dE = dD; pE = pD;
+                dD = d;  pD = pt;
+            } else if (d < dE) {
+                dE = d;  pE = pt;
+            }
+        }
+    }
+
+    // Distance to a segment
+    // Returns 1 if pixel is on the line, 0 otherwise
+    float maxPairDist = 0.95;
+    float width = 0.018;
+
+    float lines = 0.0;
+
+    // Helper as inline expression (SkSL friendly)
+    // AB
+    {
+        float2 pa = gv - pA;
+        float2 ba = pB - pA;
+        float bb = max(dot(ba, ba), 1e-7);
+        float h = clamp(dot(pa, ba) / bb, 0.0, 1.0);
+        float dl = length(pa - ba * h);
+        float valid = 1.0 - smoothstep(maxPairDist * 0.7, maxPairDist, distance(pA, pB));
+        lines = max(lines, (1.0 - smoothstep(width, width * 2.0, dl)) * valid);
+    }
+    // AC
+    {
+        float2 pa = gv - pA;
+        float2 ba = pC - pA;
+        float bb = max(dot(ba, ba), 1e-7);
+        float h = clamp(dot(pa, ba) / bb, 0.0, 1.0);
+        float dl = length(pa - ba * h);
+        float valid = 1.0 - smoothstep(maxPairDist * 0.7, maxPairDist, distance(pA, pC));
+        lines = max(lines, (1.0 - smoothstep(width, width * 2.0, dl)) * valid);
+    }
+    // BC
+    {
+        float2 pa = gv - pB;
+        float2 ba = pC - pB;
+        float bb = max(dot(ba, ba), 1e-7);
+        float h = clamp(dot(pa, ba) / bb, 0.0, 1.0);
+        float dl = length(pa - ba * h);
+        float valid = 1.0 - smoothstep(maxPairDist * 0.7, maxPairDist, distance(pB, pC));
+        lines = max(lines, (1.0 - smoothstep(width, width * 2.0, dl)) * valid);
+    }
+    // AD
+    {
+        float2 pa = gv - pA;
+        float2 ba = pD - pA;
+        float bb = max(dot(ba, ba), 1e-7);
+        float h = clamp(dot(pa, ba) / bb, 0.0, 1.0);
+        float dl = length(pa - ba * h);
+        float valid = 1.0 - smoothstep(maxPairDist * 0.7, maxPairDist, distance(pA, pD));
+        lines = max(lines, (1.0 - smoothstep(width, width * 2.0, dl)) * valid);
+    }
+    // BD
+    {
+        float2 pa = gv - pB;
+        float2 ba = pD - pB;
+        float bb = max(dot(ba, ba), 1e-7);
+        float h = clamp(dot(pa, ba) / bb, 0.0, 1.0);
+        float dl = length(pa - ba * h);
+        float valid = 1.0 - smoothstep(maxPairDist * 0.7, maxPairDist, distance(pB, pD));
+        lines = max(lines, (1.0 - smoothstep(width, width * 2.0, dl)) * valid);
+    }
+    // AE
+    {
+        float2 pa = gv - pA;
+        float2 ba = pE - pA;
+        float bb = max(dot(ba, ba), 1e-7);
+        float h = clamp(dot(pa, ba) / bb, 0.0, 1.0);
+        float dl = length(pa - ba * h);
+        float valid = 1.0 - smoothstep(maxPairDist * 0.7, maxPairDist, distance(pA, pE));
+        lines = max(lines, (1.0 - smoothstep(width, width * 2.0, dl)) * valid);
+    }
+
+    // Sparkles at the selected points
+    float sparkles = 0.0;
+    float spWidth = 0.045;
+    float tw = 0.6 + 0.4 * sin(t * 3.0);
+
+    sparkles = sparkles + exp(-dA * dA / (spWidth * spWidth)) * 1.0;
+    sparkles = sparkles + exp(-dB * dB / (spWidth * spWidth)) * 0.7;
+    sparkles = sparkles + exp(-dC * dC / (spWidth * spWidth)) * 0.5;
+    sparkles = sparkles + exp(-dD * dD / (spWidth * spWidth)) * 0.35;
+    sparkles = sparkles + exp(-dE * dE / (spWidth * spWidth)) * 0.25;
+
+    return lines * 0.85 + sparkles * tw * 0.75;
+}
+
+// ============================================================
+//  main
+// ============================================================
+
+half4 main(float2 fragCoord) {
+    float2 uv = fragCoord / resolution;
+
+    // ---- Nebula ----
+    float3 col = nebula(uv, time);
+
+    // ---- Plexus ----
+    float2 puv = (fragCoord - 0.5 * resolution) / resolution.y;
+
+    float plexus = 0.0;
+    for (int k = 0; k < 4; k++) {
+        float fk = float(k);
+        float ph = fk * 0.618;
+        float phase = fract(fk * 0.25 + time * 0.09);
+        float scale = mix(11.0, 1.2, phase);
+        float fade = smoothstep(0.0, 0.15, phase)
+                   * smoothstep(1.0, 0.82, phase);
+        plexus = plexus + plexusLayer(puv * scale + float2(fk * 8.3, fk * 3.7), time, ph) * fade;
+    }
+
+    // Warm gold plexus tint
+    float3 plexusTint = float3(0.95, 0.72, 0.32);
+    col = col + plexus * plexusTint * 0.55;
+
+    // Slight cool tint toward the horizon
+    col = col + float3(0.0, 0.005, 0.020) * (1.0 - uv.y);
+
+    // ---- Filmic tone ----
+    col = 1.0 - exp(-col * 1.25);
+    col = pow(max(col, float3(0.0)), float3(0.92));
+
+    return half4(half3(clamp(col, float3(0.0), float3(1.0))), 1.0);
+}

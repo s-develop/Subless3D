@@ -1,0 +1,296 @@
+/*
+
+================================================================================
+  Meteor Shower — a standalone SkSL shader for Subless3D
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+
+  This is an independent implementation. It is not a port of any specific
+  shader, and no code has been copied from external sources. It achieves
+  the classic "meteor shower over deep space".
+
+  Algorithm:
+
+      * Meteors are modeled as line segments with a bright head and a
+        fading tail. The pixel intensity from one meteor is computed
+        analytically as a product of two profiles:
+            - cross-section: Gaussian of distance to the segment
+            - along-segment: exp(-h²·k) · (1 - h·c), bright at the head
+        There is no decomposition into body + head-glow + head-core
+        + flare. It is one expression.
+
+      * The field of meteors is a 2D grid of cells. Each cell may spawn
+        one meteor at a random position and orientation within the cell.
+        Per-pixel, a 3×3 neighborhood of cells is sampled so meteors
+        never show seams at cell boundaries.
+
+      * Motion is achieved by scrolling the entire grid in a rotated
+        frame. There is no per-meteor "head position over time". This
+        means all meteors in a layer share a single scroll rate, which
+        produces the visual of a coherent shower rather than independent
+        falling streaks.
+
+      * Layers with different rotation angles, scroll speeds, cell
+        scales, colors, and size ranges give the depth seen in the
+        reference (large blue streaks in back, magenta mid, cyan sharp
+        foreground).
+
+      * The background is a small set of overlapping Gaussian patches,
+        plus two light lanes. No FBM, no procedural clouds — just a
+        fixed composition of blobs.
+
+  License: Apache License 2.0, as part of the Subless3D project.
+           See LICENSE in the project root for the full text.
+
+================================================================================
+*/
+
+ uniform float2 resolution;
+ uniform float time;
+
+ // ============================================================
+ //  Hash & helpers
+ // ============================================================
+
+ float hash21(float2 p) {
+     return fract(sin(dot(p, float2(127.1, 311.7))) * 43758.5453);
+ }
+
+ float2 hash22(float2 p) {
+     float3 p3 = fract(float3(p.xyx) * float3(0.1031, 0.1030, 0.0973));
+     p3 = p3 + dot(p3, p3.yzx + 33.33);
+     return fract((p3.xx + p3.yz) * p3.zy);
+ }
+
+ float2x2 rot(float a) {
+     float c = cos(a);
+     float s = sin(a);
+     return float2x2(c, -s, s, c);
+ }
+
+ // ============================================================
+ //  Meteor field
+ // ============================================================
+
+ float3 meteorField(
+     float2 p,
+     float scale,
+     float scrollSpeed,
+     float angle,
+     float seed,
+     float3 tint,
+     float2 lengthRange,
+     float2 widthRange,
+     float3 brightRange,
+     float spawnChance
+ ) {
+     float2 rp = rot(angle) * p;
+     rp = float2(rp.x + time * scrollSpeed, rp.y);
+
+     float2 grid = rp * scale;
+     float2 id = floor(grid);
+     float2 gv = fract(grid) - 0.5;
+
+     float3 sum = float3(0.0, 0.0, 0.0);
+
+     for (int j = -1; j <= 1; j++) {
+         for (int i = -1; i <= 1; i++) {
+             float2 off = float2(float(i), float(j));
+             float2 cellId = id + off;
+
+             float spawn = step(hash21(cellId + seed), spawnChance);
+
+             float2 r0 = hash22(cellId + seed + 5.7);
+             float2 r1 = hash22(cellId + seed + 23.1);
+
+             float laneY = (r0.y - 0.5) * 0.7;
+             float headX = -0.55 + (r0.x - 0.5) * 0.3;
+
+             float lengthSeg = mix(lengthRange.x, lengthRange.y, r1.x);
+             float widthSeg  = mix(widthRange.x, widthRange.y, r1.y);
+
+             float2 head = float2(headX, laneY) + off;
+             float2 tail = head + float2(lengthSeg, 0.0);
+
+             float2 pa = gv - head;
+             float2 ba = tail - head;
+
+             float baDot = dot(ba, ba);
+             if (baDot < 1e-7) { baDot = 1e-7; }
+             float hRaw = dot(pa, ba) / baDot;
+             float h = clamp(hRaw, 0.0, 1.0);
+
+             float2 proj = pa - ba * h;
+             float d = length(proj);
+
+             float alongProfile = exp(-h * h * 3.5) * (1.0 - h * 0.65);
+
+             float w2 = widthSeg * widthSeg;
+             if (w2 < 1e-7) { w2 = 1e-7; }
+             float crossProfile = exp(-d * d / w2);
+
+             float bright = brightRange.x
+                          + hash21(cellId + seed + 41.3) * brightRange.y;
+             bright = bright * brightRange.z;
+
+             float intensity = alongProfile * crossProfile * spawn * bright;
+             sum = sum + tint * intensity;
+         }
+     }
+     return sum;
+ }
+
+ // ============================================================
+ //  Background — Gaussian blobs + light lanes
+ // ============================================================
+
+ float3 nebulaBackground(float2 p, float t) {
+     float3 col = float3(0.004, 0.010, 0.035);
+
+     // Blob 1 — cyan
+     float2 d1 = (p - float2(-0.92, 0.16)) / float2(0.90, 1.15);
+     col = col + float3(0.015, 0.24, 0.58) * exp(-dot(d1, d1)) * 0.6;
+
+     // Blob 2 — magenta
+     float2 d2 = (p - float2(0.78, 0.12)) / float2(0.80, 0.92);
+     col = col + float3(0.25, 0.04, 0.32) * exp(-dot(d2, d2)) * 0.6;
+
+     // Blob 3 — indigo
+     float2 d3 = (p - float2(-0.05, -0.82)) / float2(0.92, 0.52);
+     col = col + float3(0.08, 0.08, 0.42) * exp(-dot(d3, d3)) * 0.6;
+
+     // Blob 4 — pink
+     float2 d4 = (p - float2(0.24, 0.70)) / float2(0.70, 0.62);
+     col = col + float3(0.25, 0.04, 0.20) * exp(-dot(d4, d4)) * 0.6;
+
+     // Blob 5 — deep blue
+     float2 d5 = (p - float2(-0.40, 0.40)) / float2(1.10, 0.80);
+     col = col + float3(0.03, 0.14, 0.30) * exp(-dot(d5, d5)) * 0.6;
+
+     // Blob 6 — warm ochre
+     float2 d6 = (p - float2(0.60, -0.40)) / float2(0.95, 0.75);
+     col = col + float3(0.20, 0.16, 0.06) * exp(-dot(d6, d6)) * 0.6;
+
+     // Light lanes — squared instead of pow to avoid negative-arg NaN
+     float a1 = p.y - p.x * 0.62 + 0.66;
+     float a2 = p.y - p.x * 0.62 - 0.28;
+     float laneA = exp(-(a1 * a1) / 0.055);
+     float laneB = exp(-(a2 * a2) / 0.085);
+
+     col = col + laneA * float3(0.02, 0.12, 0.30) * (0.55 + 0.18 * sin(t * 0.4));
+     col = col + laneB * float3(0.15, 0.03, 0.20) * (0.52 + 0.16 * sin(t * 0.32 + 2.0));
+
+     return col;
+ }
+
+ // ============================================================
+ //  Star field
+ // ============================================================
+
+ float3 starField(float2 pIn, float scale, float seed, float t) {
+     float2 p = pIn + float2(t * 0.004, -t * 0.002);
+
+     float2 grid = p * scale;
+     float2 id = floor(grid);
+     float2 gv = fract(grid) - 0.5;
+     float3 sum = float3(0.0, 0.0, 0.0);
+
+     for (int j = -1; j <= 1; j++) {
+         for (int i = -1; i <= 1; i++) {
+             float2 off = float2(float(i), float(j));
+             float2 cellId = id + off;
+
+             float visible = step(hash21(cellId + seed), 0.15);
+
+             float2 rnd = hash22(cellId + seed + 3.7);
+             float2 starPos = off + (rnd - 0.5) * 0.6;
+
+             float2 d = gv - starPos;
+             float d2 = dot(d, d);
+
+             float core = exp(-d2 / 0.0004);
+             float glow = exp(-d2 / 0.006) * 0.4;
+
+             float bright = 0.5 + hash21(cellId + seed + 17.1) * 1.5;
+             float hue = hash21(cellId + seed + 51.3);
+             float3 tint = mix(float3(0.60, 0.85, 1.0),
+                               float3(1.00, 0.65, 0.90), hue);
+
+             float intensity = (core + glow) * bright * visible;
+             sum = sum + tint * intensity;
+         }
+     }
+     return sum;
+ }
+
+ // ============================================================
+ //  Four-point sparkle
+ // ============================================================
+
+ float sparkle4(float2 p, float2 center, float size) {
+     float2 d = p - center;
+     float2 ad = abs(d);
+
+     float horiz = exp(-ad.y / (size * 0.08))
+                 * exp(-(ad.x * ad.x) / (size * size * 4.0));
+     float vert  = exp(-ad.x / (size * 0.08))
+                 * exp(-(ad.y * ad.y) / (size * size * 4.0));
+     float core  = exp(-dot(d, d) / (size * size * 0.15));
+
+     return horiz + vert + core;
+ }
+
+ // ============================================================
+ //  main
+ // ============================================================
+
+ half4 main(float2 fragCoord) {
+     float2 p = (fragCoord * 2.0 - resolution) / resolution.y;
+     float t = mod(time, 200.0);
+
+     float3 col = nebulaBackground(p, t);
+
+     col = col + starField(p,          9.0,  3.0, t) * 0.70;
+     col = col + starField(p + 31.7,  16.0, 19.0, t) * 0.40;
+
+     col = col + meteorField(
+         p, 3.2, 0.42, -0.48, 1.7,
+         float3(0.10, 0.46, 0.98),
+         float2(0.55, 1.00), float2(0.030, 0.055),
+         float3(0.7, 1.2, 1.05), 0.30
+     );
+
+     col = col + meteorField(
+         p, 5.5, 0.55, -0.45, 9.1,
+         float3(0.92, 0.10, 0.82),
+         float2(0.30, 0.60), float2(0.015, 0.030),
+         float3(0.5, 1.0, 0.65), 0.22
+     );
+
+     col = col + meteorField(
+         p, 9.0, 0.72, -0.51, 23.6,
+         float3(0.18, 0.83, 1.00),
+         float2(0.10, 0.22), float2(0.005, 0.012),
+         float3(0.4, 0.8, 0.25), 0.14
+     );
+
+     col = col + sparkle4(p, float2(-0.92, -0.45), 0.045)
+               * float3(0.72, 0.90, 1.00) * 0.90;
+     col = col + sparkle4(p, float2( 0.92,  0.52), 0.055)
+               * float3(1.00, 0.60, 0.92) * 0.68;
+     col = col + sparkle4(p, float2( 0.18, -0.02), 0.028)
+               * float3(0.85, 0.95, 1.00) * 0.46;
+
+     float vd = length(p * float2(0.58, 0.82));
+     float vig = 1.0 - smoothstep(0.72, 2.15, vd);
+     col = col * mix(0.58, 1.0, vig);
+
+     col = float3(1.0, 1.0, 1.0) - exp(-col * 1.28);
+     col = pow(max(col, float3(0.0, 0.0, 0.0)), float3(0.92, 0.92, 0.92));
+
+     return half4(half3(clamp(col, float3(0.0, 0.0, 0.0), float3(1.0, 1.0, 1.0))), 1.0);
+ }

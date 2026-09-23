@@ -1,0 +1,19 @@
+Subless3D
+Copyright 2026 https://github.com/s-develop
+
+This product includes software developed by:
+
+  * JetBrains s.r.o. — Compose Multiplatform, Skiko, Kotlin
+    Licensed under the Apache License 2.0
+    https://www.jetbrains.com/
+
+  * The Skia Authors — Skia Graphics Library
+    Licensed under the BSD 3-Clause License
+    https://skia.org/
+
+  * The Kotlinx.coroutines Authors
+    Licensed under the Apache License 2.0
+    https://github.com/Kotlin/kotlinx.coroutines
+
+Example shaders under examples/ are licensed separately.
+See the LICENSE file for scope and disclaimer.

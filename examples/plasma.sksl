@@ -1,0 +1,173 @@
+/*
+
+================================================================================
+  Plasma Filaments — raymarched emissive threads
+================================================================================
+
+  Author:        <your name or nickname>
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+                 See LICENSE in the project root for the full text.
+
+  Original implementation. No code shared with any third-party shader.
+
+================================================================================
+*/
+
+uniform float2 resolution;
+uniform float time;
+
+// ============================================================
+//  Interference field — sum of sines with irrational ratios
+//  Produces a tangled wave pattern. Zero-crossings of this
+//  field are the fold lines where the filaments live.
+// ============================================================
+
+float field(float3 p, float t) {
+    float v = 0.0;
+    v += sin(p.x * 1.13 + p.y * 1.71 + p.z * 0.53 + t * 0.40);
+    v += sin(p.x * 2.31 - p.y * 1.33 + p.z * 1.97 + t * 0.55) * 0.6;
+    v += sin(p.x * 0.73 + p.y * 2.91 - p.z * 1.41 + t * 0.30) * 0.45;
+    v += sin(p.x * 3.11 + p.y * 0.41 + p.z * 2.71 + t * 0.65) * 0.30;
+    return v * 0.42;
+}
+
+// ============================================================
+//  Ridge transform — turns the zero-crossings into thin
+//  bright lines. Exponent controls thickness: higher =
+//  thinner filaments.
+// ============================================================
+
+float ridge(float3 p, float t) {
+    float n = field(p, t);
+    float r = 1.0 - abs(n);
+    r = pow(max(r, 0.0), 6.0);
+    return r;
+}
+
+// ============================================================
+//  Palette — five anchors
+//  deep blue → cyan → magenta → gold → white
+// ============================================================
+
+float3 palette(float h) {
+    float3 c0 = float3(0.05, 0.10, 0.55);
+    float3 c1 = float3(0.15, 0.85, 1.00);
+    float3 c2 = float3(1.00, 0.20, 0.90);
+    float3 c3 = float3(1.00, 0.80, 0.25);
+    float3 c4 = float3(1.00, 1.00, 1.00);
+
+    float u = fract(h) * 4.0;
+    float3 col = c0;
+    if (u < 1.0)      { col = mix(c0, c1, u); }
+    else if (u < 2.0) { col = mix(c1, c2, u - 1.0); }
+    else if (u < 3.0) { col = mix(c2, c3, u - 2.0); }
+    else              { col = mix(c3, c4, u - 3.0); }
+    return col;
+}
+
+// ============================================================
+//  ACES tone mapping — Narkowicz approximation
+// ============================================================
+
+float3 aces(float3 x) {
+    float a = 2.51;
+    float b = 0.03;
+    float c = 2.43;
+    float d = 0.59;
+    float e = 0.14;
+    return clamp((x * (a * x + b)) / (x * (c * x + d) + e),
+                 float3(0.0), float3(1.0));
+}
+
+// ============================================================
+//  main
+// ============================================================
+
+half4 main(float2 fragCoord) {
+    float t = time;
+
+    // Camera ray
+    float3 rayOrigin = float3(0.0, 0.0, -1.0 - 0.4 * sin(t * 0.10));
+    float3 rayDir = normalize(float3(
+        2.0 * fragCoord - resolution.xy,
+        resolution.y));
+    rayDir.y = -rayDir.y;
+
+    float3 accum = float3(0.0);
+    float3 p = rayOrigin;
+
+    // Eight march steps. Kept small so SkSL's loop unroller
+    // produces a manageable tree.
+    for (float i = 0.0; i < 8.0; i += 1.0) {
+        // Slow XY rotation for the swirl
+        float spin = t * 0.20 + p.z * 0.35;
+        float cs = cos(spin);
+        float sn = sin(spin);
+        float3 pr = float3(
+            cs * p.x - sn * p.y,
+            sn * p.x + cs * p.y,
+            p.z
+        );
+
+        // Step size from the difference between a fine and a
+        // coarse sampling. The ray slows down near ridges,
+        // which packs more samples there and brightens them.
+        float fine   = field(pr * 9.0, t);
+        float coarse = field(pr,       t);
+        float s = 0.05 + abs(fine * 0.3 - coarse) * 0.55;
+
+        // Additional sinusoid bend — pushes the threads around
+        s += abs(pr.y * 0.2 + sin(pr.z * 1.6 + abs(pr.x) * 0.5)) * 0.30;
+
+        p = p + rayDir * s;
+
+        // Emissive density at the new position
+        float r = ridge(pr * 2.0, t);
+        float glow = smoothstep(0.05, 0.70, r);
+
+        // Hue slides along the ray and along the filament
+        float hue = pr.z * 0.16
+                  + pr.x * 0.10
+                  + i * 0.09
+                  + coarse * 0.35
+                  + t * 0.04;
+        float3 tint = palette(hue);
+
+        // Hot cores go near-white
+        float core = smoothstep(0.68, 0.95, r);
+        tint = mix(tint, float3(1.0, 0.98, 0.94), core * 0.75);
+
+        // Emissive accumulation — no absorption term
+        accum = accum + glow * tint / (0.08 + s);
+    }
+
+    // HDR — multiplier tuned so bright cores land in 1.0–4.0
+    float3 hdr = accum * accum * 0.0009;
+
+    float3 color = aces(hdr);
+
+    // Saturation boost — the key to colorful, not washed out
+    float lum = dot(color, float3(0.299, 0.587, 0.114));
+    color = mix(float3(lum), color, 2.10);
+    color = max(color, float3(0.0));
+
+    // Soft emissive bloom around bright cores
+    float bright = dot(color, float3(0.299, 0.587, 0.114));
+    color += color * smoothstep(0.30, 0.95, bright) * 0.75;
+
+    // Cool tint in shadows, warm in highlights
+    color += float3(0.006, 0.008, 0.022) * (1.0 - lum);
+
+    // Vignette — soft, does not kill edge brightness
+    float2 vuv = fragCoord / resolution;
+    float vig = vuv.x * vuv.y * (1.0 - vuv.x) * (1.0 - vuv.y);
+    vig = clamp(pow(16.0 * vig, 0.30), 0.0, 1.0);
+    color *= mix(0.45, 1.0, vig);
+
+    // sRGB gamma
+    color = pow(max(color, float3(0.0)), float3(1.0 / 2.2));
+
+    return half4(half3(clamp(color, 0.0, 1.0)), 1.0);
+}

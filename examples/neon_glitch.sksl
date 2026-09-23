@@ -1,0 +1,363 @@
+/*
+
+================================================================================
+  Neon Glitch — volumetric neon glyph field
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+
+  Original work. No code shared with any third-party shader.
+
+  Visual:
+      A translucent cube contains columns of glowing neon glyphs.
+      Each column has its own fill cycle: the "level" of glyphs rises
+      from the bottom of the cube toward the top, then resets. Above
+      the fill line a single glyph descends back toward the level.
+      Horizontal streaks occasionally flash across the top half of
+      the cube. Cyan wireframe marks the cube's edges.
+
+  Method:
+
+      * Analytic slab-method ray–box intersection. No signed distance
+        field, no ray marching through an SDF.
+
+      * Volume sampled at 64 fixed steps. Each step computes the 3D
+        cell it belongs to, its XZ column seed, the column's current
+        fill level, and whether this cell is above or below it.
+
+      * Glyphs are 14-segment displays (7-segment plus 4 diagonals).
+        All segment flags come from a single 3D hash of the cell.
+
+      * Density gradient emerges from the fill cycle itself: bottom
+        cells stay lit almost the whole cycle, top cells only near
+        the peak. This produces the "accumulation" look without any
+        explicit pile formula.
+
+      * Horizontal streaks are a separate YZ-keyed layer — a wall
+        of light moving along X at random speed, appearing only in
+        the upper half of the cube.
+
+================================================================================
+*/
+
+uniform float2 resolution;
+uniform float time;
+
+// ============================================================
+//  Hashes
+// ============================================================
+
+float hash11(float x) {
+    return fract(sin(x * 78.233) * 43758.5453);
+}
+
+float hash31(float3 p) {
+    return fract(sin(dot(p, float3(127.1, 311.7, 74.7))) * 43758.5453);
+}
+
+// ============================================================
+//  Ray–box slab intersection — analytic
+// ============================================================
+
+float2 raySlab(float3 ro, float3 rd, float3 hs) {
+    float3 safeD = float3(
+        abs(rd.x) < 1e-6 ? (rd.x < 0.0 ? -1e-6 : 1e-6) : rd.x,
+        abs(rd.y) < 1e-6 ? (rd.y < 0.0 ? -1e-6 : 1e-6) : rd.y,
+        abs(rd.z) < 1e-6 ? (rd.z < 0.0 ? -1e-6 : 1e-6) : rd.z
+    );
+    float3 invD = float3(1.0) / safeD;
+    float3 tA = (-hs - ro) * invD;
+    float3 tB = ( hs - ro) * invD;
+    float3 lo = min(tA, tB);
+    float3 hi = max(tA, tB);
+    return float2(
+        max(max(lo.x, lo.y), lo.z),
+        min(min(hi.x, hi.y), hi.z)
+    );
+}
+
+// ============================================================
+//  Capsule and 14-segment glyph
+// ============================================================
+
+float capsule(float2 p, float2 a, float2 b, float w) {
+    float2 pa = p - a;
+    float2 ba = b - a;
+    float bb = max(dot(ba, ba), 1e-7);
+    float h = clamp(dot(pa, ba) / bb, 0.0, 1.0);
+    float d = length(pa - ba * h);
+    return 1.0 - smoothstep(w, w + 0.020, d);
+}
+
+float glyph14(float2 p, float3 sA, float3 sB, float3 sC) {
+    const float hx = 0.30;
+    const float hy = 0.42;
+    const float w  = 0.062;
+
+    float g = 0.0;
+
+    // Seven-segment core
+    float s0 = step(0.5, sA.x);
+    float s1 = step(0.5, sA.y);
+    float s2 = step(0.5, sA.z);
+    float s3 = step(0.5, sB.x);
+    float s4 = step(0.5, sB.y);
+    float s5 = step(0.5, sB.z);
+    float s6 = step(0.5, sC.x);
+
+    g = max(g, capsule(p, float2(-hx,  hy), float2( hx,  hy), w) * s0);
+    g = max(g, capsule(p, float2( hx,  hy), float2( hx, 0.0), w) * s1);
+    g = max(g, capsule(p, float2( hx, 0.0), float2( hx, -hy), w) * s2);
+    g = max(g, capsule(p, float2(-hx, -hy), float2( hx, -hy), w) * s3);
+    g = max(g, capsule(p, float2(-hx, 0.0), float2(-hx, -hy), w) * s4);
+    g = max(g, capsule(p, float2(-hx,  hy), float2(-hx, 0.0), w) * s5);
+    g = max(g, capsule(p, float2(-hx, 0.0), float2( hx, 0.0), w) * s6);
+
+    // Four diagonals for alphanumeric feel
+    float d0 = step(0.5, sC.y);
+    float d1 = step(0.5, sC.z);
+
+    g = max(g, capsule(p, float2(-hx,  hy), float2( 0.0, 0.0), w * 0.8) * d0);
+    g = max(g, capsule(p, float2( hx,  hy), float2( 0.0, 0.0), w * 0.8) * d1);
+    g = max(g, capsule(p, float2(-hx, -hy), float2( 0.0, 0.0), w * 0.8) * d0 * (1.0 - d1));
+    g = max(g, capsule(p, float2( hx, -hy), float2( 0.0, 0.0), w * 0.8) * d1 * (1.0 - d0));
+
+    return g;
+}
+
+// ============================================================
+//  Neon palette — six saturated hues
+// ============================================================
+
+float3 neon(float h) {
+    if (h < 0.18) { return float3(1.00, 0.12, 0.70); }
+    if (h < 0.38) { return float3(0.10, 0.95, 1.00); }
+    if (h < 0.56) { return float3(0.60, 0.18, 1.00); }
+    if (h < 0.72) { return float3(0.28, 1.00, 0.45); }
+    if (h < 0.86) { return float3(1.00, 0.80, 0.15); }
+    return float3(1.00, 0.30, 0.22);
+}
+
+// ============================================================
+//  Camera rotations
+// ============================================================
+
+float3 rotY(float3 v, float a) {
+    float c = cos(a);
+    float s = sin(a);
+    return float3(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
+}
+
+float3 rotX(float3 v, float a) {
+    float c = cos(a);
+    float s = sin(a);
+    return float3(v.x, c * v.y - s * v.z, s * v.y + c * v.z);
+}
+
+// ============================================================
+//  main
+// ============================================================
+
+half4 main(float2 fragCoord) {
+    float2 p2 = (fragCoord - 0.5 * resolution) / resolution.y;
+
+    // Camera — slow orbit, slight tilt oscillation
+    float3 eye = float3(0.0, 0.15, -3.4);
+    float3 dir = normalize(float3(p2, 1.30));
+
+    float ay = time * 0.16;
+    float ax = 0.18 + sin(time * 0.18) * 0.05;
+    eye = rotY(eye, ay);
+    dir = rotY(dir, ay);
+    eye = rotX(eye, ax);
+    dir = rotX(dir, ax);
+
+    // Screen-aligned frame — glyphs always face the camera
+    float3 wUp = float3(0.0, 1.0, 0.0);
+    float3 right = cross(dir, wUp);
+    float rl = length(right);
+    if (rl < 1e-4) { right = float3(1.0, 0.0, 0.0); }
+    else { right = right / rl; }
+    float3 up = cross(right, dir);
+
+    // Cube
+    float3 boxH = float3(1.0, 1.0, 1.0);
+    float2 tb = raySlab(eye, dir, boxH);
+
+    float3 col = float3(0.004, 0.005, 0.012);
+
+    if (tb.y <= tb.x || tb.y < 0.0) {
+        float rim = smoothstep(1.3, 0.4, length(p2)) * 0.05;
+        col = col + float3(0.12, 0.02, 0.24) * rim;
+        return half4(half3(clamp(col, float3(0.0), float3(1.0))), 1.0);
+    }
+
+    float t0 = max(tb.x, 0.0);
+    float t1 = tb.y;
+
+    // ---- Wireframe — analytic from slab distances ----
+    {
+        float3 invD = float3(1.0) / float3(
+            abs(dir.x) < 1e-6 ? 1e-6 : dir.x,
+            abs(dir.y) < 1e-6 ? 1e-6 : dir.y,
+            abs(dir.z) < 1e-6 ? 1e-6 : dir.z
+        );
+        float3 tA = (-boxH - eye) * invD;
+        float3 tB = ( boxH - eye) * invD;
+        float3 lo = min(tA, tB);
+
+        float dxy = abs(lo.x - lo.y);
+        float dxz = abs(lo.x - lo.z);
+        float dyz = abs(lo.y - lo.z);
+        float near = min(min(dxy, dxz), dyz);
+
+        float ew = 0.004 + 0.020 / (1.0 + 26.0 * near);
+        float edge = 1.0 - smoothstep(0.0, ew, near);
+        col = col + float3(0.18, 0.92, 1.00) * edge * 2.0;
+    }
+
+    // ---- Volume march ----
+    const int STEPS = 34;
+    const float GRID = 6.0;
+
+    float3 accum = float3(0.0);
+    float3 haze = float3(0.0);
+
+    for (int si = 0; si < STEPS; si++) {
+        float fs = (float(si) + 0.5) / float(STEPS);
+        float t = mix(t0, t1, fs);
+        float3 P = eye + dir * t;
+
+        // Cell
+        float3 cell = floor(P * GRID);
+        float3 cc = (cell + 0.5) / GRID;
+
+        // Column seed — XZ only
+        float colSeed = hash31(float3(cell.x, 3.7, cell.z) * 1.11);
+
+        // ---- Per-column fill cycle ----
+        // The column's "level" rises from bottom to top of the cube
+        // over `dur` seconds, then resets. Different columns have
+        // different durations and phases, so the cube looks alive.
+        float dur = 10.0 + colSeed * 8.0;
+        float phase = fract((time + colSeed * 20.0) / dur);
+        float fillY = mix(-boxH.y - 0.1, boxH.y + 0.1, phase);
+
+        // Cell below the fill line?
+        float belowFill = 1.0 - smoothstep(fillY - 0.04, fillY + 0.04, cc.y);
+
+        // ---- Falling glyph ----
+        // Rides above the fill line, descending toward it
+        float fallPhase = fract((time + colSeed * 31.7) * (0.6 + colSeed * 0.5));
+        float fallY = mix(boxH.y + 0.15, fillY, fallPhase);
+        float isFalling = (1.0 - smoothstep(0.03, 0.06, abs(cc.y - fallY)))
+                        * smoothstep(fillY, fillY + 0.08, cc.y);
+
+        float filled = max(belowFill, isFalling);
+
+            // ---- Per-cell presence ----
+            float cellSeed = hash31(cell * 0.73 + float3(2.3, 5.7, 3.9));
+            float active = step(0.62, cellSeed);         // было 0.35
+            float rare = step(0.96, cellSeed);           // было 0.94
+            float fSeed = hash31(cell * 1.9 + floor(time * 4.0) * 0.13);
+            float flicker = 0.72 + 0.28 * step(0.22, fSeed);
+
+
+
+        // ---- Screen-aligned glyph UV ----
+        float3 off = P - cc;
+        float2 guv = float2(dot(off, right), dot(off, up)) * GRID * 1.55;
+
+        // ---- Segment flags ----
+        float base = cellSeed * 41.0;
+        float3 sA = float3(hash11(base + 0.0), hash11(base + 1.0), hash11(base + 2.0));
+        float3 sB = float3(hash11(base + 3.0), hash11(base + 4.0), hash11(base + 5.0));
+        float3 sC = float3(hash11(base + 6.0), hash11(base + 7.0), hash11(base + 8.0));
+
+        float mask = glyph14(guv, sA, sB, sC);
+
+        // ---- Tint ----
+        float hue = hash31(cell * 0.31 + float3(1.3, 9.1, 4.7));
+        float3 tint = neon(hue);
+
+        // Falling glyphs are brighter; rare cells are brighter still
+        float bright = mix(1.0, 2.4, isFalling);
+        bright = bright * mix(1.0, 1.7, rare);
+
+        // ---- Depth fade ----
+        float df = exp(-t * 0.16);
+
+        // ---- Accumulate glyph ----
+        float amount = mask * filled * active * flicker * bright * df;
+        accum = accum + tint * amount * 1.7;
+
+        // ---- Soft haze around active cells ----
+        float gd = length(guv);
+        float cellGlow = 1.0 - smoothstep(0.0, 1.2, gd);
+        haze = haze + tint * cellGlow * filled * active * df * 0.012;
+    }
+
+    col = col + accum + haze;
+
+    // ---- Horizontal streaks — separate YZ-keyed layer ----
+    // A vertical wall of light moves along X through the upper
+    // half of the cube. Each YZ row has its own speed and phase.
+    {
+        const float RGRID = 5.0;
+        float3 Pm = eye + dir * (t0 + t1) * 0.5;
+        float3 rCell = floor(Pm * RGRID);
+
+        float rSeed = hash31(float3(3.1, rCell.y, rCell.z));
+        float rActive = step(0.82, rSeed);
+        float rDir = fract(rCell.y * 0.5) < 0.5 ? 1.0 : -1.0;
+        float rSpeed = 0.8 + hash31(float3(8.3, rCell.y, rCell.z)) * 0.9;
+        float rPhase = hash31(float3(2.7, rCell.y, rCell.z));
+
+        // Position along X in [-1.1, 1.1]
+        float rX = fract(time * rSpeed + rPhase) * 2.2 - 1.1;
+        float rXSigned = rDir > 0.0 ? rX : -rX;
+
+        // Y band — upper half of the cube only
+        float yBand = smoothstep(-0.20, 0.10, Pm.y)
+                    * (1.0 - smoothstep(0.80, 1.00, Pm.y));
+
+        // Distance from the ray to the streak position
+        float3 sPos = float3(rXSigned, Pm.y, Pm.z);
+        float3 sOff = sPos - eye;
+        float sAlong = dot(sOff, dir);
+        if (sAlong > 0.0) {
+            float3 sPerp = sOff - dir * sAlong;
+            float sDist = length(sPerp);
+            float thick = 0.07;
+            float streak = 1.0 - smoothstep(thick, thick + 0.04, sDist);
+
+            float3 rTint = rDir > 0.0
+                ? float3(1.00, 0.15, 0.72)
+                : float3(0.58, 0.18, 1.00);
+
+            float df = exp(-sAlong * 0.15);
+            col = col + rTint * streak * rActive * yBand * df * 1.6;
+        }
+    }
+
+    // ---- Vignette ----
+    float vig = 1.0 - smoothstep(0.35, 1.30, length(p2));
+    col = col * (0.55 + 0.45 * vig);
+
+    // ---- Bloom on bright regions ----
+    float lum = dot(col, float3(0.299, 0.587, 0.114));
+    col = col + col * smoothstep(0.5, 1.6, lum) * 0.55;
+
+    // ---- Scanlines ----
+    float scan = 0.5 + 0.5 * sin(fragCoord.y * 3.14159);
+    col = col * (0.90 + 0.10 * scan);
+
+    // ---- Tone ----
+    col = pow(max(col, float3(0.0)), float3(0.92));
+    col = col * 0.85;
+
+    return half4(half3(clamp(col, float3(0.0), float3(1.0))), 1.0);
+}
