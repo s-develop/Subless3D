@@ -1,0 +1,138 @@
+/*
+
+================================================================================
+  Neon Portal (Cyber Torus) — interactive space-warping energy ring
+================================================================================
+
+  Author:        https://github.com/s-develop
+  Year:          2026
+  Project:       Subless3D
+  License:       Apache License 2.0
+
+  Original work. No code shared with any third-party shader.
+
+  Visual:
+      A pulsating, iridescent energy torus floating over a transparent background.
+      The geometry undergoes continuous fluid distortion, vibrating like stable
+      plasma. Colors dynamically cycle through the HSV spectrum based on angular
+      and radial coordinates. The core features an inner purple hue, enveloped
+      by a dual-layered neon glow that alternates between cyan and magenta.
+
+  Method:
+
+      * Spatial Deformation (Domain Warping):
+        The texture coordinate space is warped using a three-layer combination
+        of trigonometric waves:
+            wave1 = sin(p.x * 6.0 + t * 1.5) * 0.08
+            wave2 = cos(p.y * 5.0 - t * 1.2) * 0.06
+            wave3 = sin(length(p) * 8.0 - t * 2.0) * 0.04
+        Applying these offsets simulates liquid-like surface rippling.
+
+      * Angular Rotation & Time Drift:
+        The warped space is transformed using a custom 2D rotation matrix:
+            float2x2(cosA, sinA, -sinA, cosA)
+        The rotation speed is modulated by the polar angle, causing different
+        sections of the torus to twist at varying rates.
+
+      * Implicit Implicit Surface Logic:
+        The shape is generated analytically by calculating distances to
+        primitive boundaries:
+            d = abs(length(p) - torusR) - tubeR (Torus Distance Field)
+            hole = length(p) - 0.06             (Central Aperture)
+        A smooth minimum blending function (`mix` and quadratic correction)
+        fuses the primitives into a unified organic structure.
+
+      * Dynamic HSV Colorization:
+        Instead of static palettes, color is computed via an analytical
+        HSV-to-RGB conversion. The hue shifts dynamically according to
+        the current polar angle and radial distance over time.
+
+      * Multi-Stage Neon Glow:
+        Glow is generated using two mathematical approaches:
+            - Sharp Inner Glow: `smoothstep(0.05, 0.0, abs(d))`
+            - Exponential Neon Aura: `exp(-abs(d) * 15.0) * 0.6`
+        The neon aura oscillates out of phase using independent `sin(t)`
+        and `cos(t)` cycles, generating the shifting cyan/magenta fringe.
+
+      * Alpha Mask Isolation:
+        The black background is completely eliminated. The final alpha channel
+        is a composite of the precise shape mask and the extended exponential
+        glow, clamping the output to a safe [0.0, 1.0] range to ensure clean
+        alpha blending when rendered over C# / Avalonia UI components.
+
+================================================================================
+*/
+uniform float2 resolution;
+uniform float time;
+
+float3 hsv2rgb(float h, float s, float v) {
+    float c = v * s;
+    float h6 = h * 6.0;
+    float modulo = h6 - 2.0 * floor(h6 / 2.0);
+    float x = c * (1.0 - abs(modulo - 1.0));
+    float m = v - c;
+
+    float r, g, b;
+    if (h < 1.0/6.0) {
+        r = c; g = x; b = 0.0;
+    } else if (h < 2.0/6.0) {
+        r = x; g = c; b = 0.0;
+    } else if (h < 3.0/6.0) {
+        r = 0.0; g = c; b = x;
+    } else if (h < 4.0/6.0) {
+        r = 0.0; g = x; b = c;
+    } else if (h < 5.0/6.0) {
+        r = x; g = 0.0; b = c;
+    } else {
+        r = c; g = 0.0; b = x;
+    }
+
+    return float3(r + m, g + m, b + m);
+}
+
+half4 main(float2 fragCoord) {
+    float2 uv = (fragCoord - 0.5 * resolution) / resolution.y;
+    float2 p = uv;
+
+    float wave1 = sin(p.x * 6.0 + time * 1.5) * 0.08;
+    float wave2 = cos(p.y * 5.0 - time * 1.2) * 0.06;
+    float wave3 = sin(length(p) * 8.0 - time * 2.0) * 0.04;
+
+    p.x += wave1 + wave3;
+    p.y += wave2 + wave3;
+
+    float angle = atan(p.y, p.x);
+    float dist = length(p);
+    float cosA = cos(angle * 0.3 + time * 0.5);
+    float sinA = sin(angle * 0.3 + time * 0.5);
+
+    float2 rotated;
+    rotated.x = p.x * cosA - p.y * sinA;
+    rotated.y = p.x * sinA + p.y * cosA;
+    p = rotated;
+
+    float torusR = 0.28;
+    float tubeR = 0.12;
+    float d = abs(length(p) - torusR) - tubeR;
+
+    float hole = length(p) - 0.06;
+
+    float h = clamp(0.5 + 0.5 * (hole - d) / 0.05, 0.0, 1.0);
+    float shape = mix(hole, d, h) - 0.05 * h * (1.0 - h);
+
+    float hue = 0.55 + 0.25 * sin(angle * 2.0 + time) + 0.1 * cos(dist * 10.0 - time * 2.0);
+    float3 color = hsv2rgb(hue, 0.85, 1.0);
+
+    float innerGlow = smoothstep(0.05, 0.0, abs(d));
+    color = color + float3(0.3, 0.1, 0.4) * innerGlow;
+
+    float neonGlow = exp(-abs(d) * 15.0) * 0.6;
+    color = color + float3(0.2, 0.5, 1.0) * neonGlow * (0.5 + 0.5 * sin(time));
+    color = color + float3(1.0, 0.2, 0.8) * neonGlow * (0.5 + 0.5 * cos(time));
+
+    float alpha = smoothstep(0.01, -0.01, shape);
+    alpha = alpha + neonGlow * 0.5;
+    alpha = clamp(alpha, 0.0, 1.0);
+
+    return half4(half3(clamp(color, 0.0, 1.0)), half(alpha));
+}
