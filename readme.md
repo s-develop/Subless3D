@@ -1,5 +1,4 @@
 ![Subless3D main window](docs/screenshot.png)
-```markdown
 
 # Subless3D — Shader Baker
 
